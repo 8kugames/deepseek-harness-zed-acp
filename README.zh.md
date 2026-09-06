@@ -2,6 +2,49 @@
 
 [English](README.md) | 中文
 
+-----
+
+## 关于本 Fork
+
+本仓库是 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 fork，基线为 `0.1.2-rc.1`，其上仅新增一个变更集：`dsh --profile acp` 背后的 ACP 服务器获得了面向 Zed 的支持。
+
+- 公开声明的认证方式，附 `deepseek-api-key` 门禁：凭据缺失时拒绝创建会话。
+- 默认/计划两种会话模式，呈现在 agent 面板的模式选择器中。
+- agent preset 与权限的配置选项，附本地化标签。
+- 单选用户问题桥接为 `session/request_permission` 一问一答。
+
+官方 `@deepseek-ai/dsh` npm 包发布的是不含本变更集的上游基线，因此请按下面的方式从本仓库 checkout 运行。
+
+### Zed 快速上手
+
+前置要求：Node.js `^22.19 || >=24`、pnpm，以及一个 [DeepSeek API key](https://platform.deepseek.com/)。
+
+```sh
+git clone https://github.com/8kugames/deepseek-harness-zed-acp.git
+cd deepseek-harness-zed-acp
+pnpm install
+pnpm run build   # once per checkout; rerun after pulling new commits
+```
+
+在 Zed 的 `settings.json` 中注册 agent 服务器；key 也可以放在 shell 环境里，而不写入 `env` 块：
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek Harness": {
+      "type": "custom",
+      "command": "pnpm",
+      "args": ["-C", "/absolute/path/to/deepseek-harness-zed-acp", "dsh", "--profile", "acp"],
+      "env": { "DEEPSEEK_API_KEY": "sk-your-key-here" }
+    }
+  }
+}
+```
+
+首个 Zed 会话会在 `~/.dsh/profiles/acp` 下自动初始化 profile，并使用该 key 完成认证。模式切换、preset、权限、会话历史与故障排查参见[在 Zed 中使用 DeepSeek Harness](docs/user/guide/zed-acp.zh.md)。
+
+-----
+
 DeepSeek Harness（`dsh`）是由 [DeepSeek AI](https://deepseek.com) 开发的开源 agent harness（智能体框架）。
 
 它构建于**一切皆插件**的架构之上，由 [Cordis](https://github.com/cordiverse/cordis) 驱动，其设计参见论文 [_A Programming Paradigm for Spatiotemporal Composability_](https://arxiv.org/abs/2608.25512)。

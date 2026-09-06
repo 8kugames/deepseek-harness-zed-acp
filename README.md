@@ -2,6 +2,49 @@
 
 English | [中文](README.zh.md)
 
+-----
+
+## About this fork
+
+This repository is a fork of [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) at the `0.1.2-rc.1` baseline with one additional change set: the ACP server behind `dsh --profile acp` gains Zed-facing support.
+
+- Advertised authentication with a `deepseek-api-key` gate that refuses session creation while the credential is missing.
+- Default and plan session modes surfaced to the agent panel's mode picker.
+- Agent-preset and permission configuration options with localized labels.
+- Single-choice user questions bridged onto `session/request_permission` round trips.
+
+The official `@deepseek-ai/dsh` npm package publishes the upstream baseline without this change set, so run this fork from a checkout as follows.
+
+### Quick start with Zed
+
+Prerequisites: Node.js `^22.19 || >=24`, pnpm, and a [DeepSeek API key](https://platform.deepseek.com/).
+
+```sh
+git clone https://github.com/8kugames/deepseek-harness-zed-acp.git
+cd deepseek-harness-zed-acp
+pnpm install
+pnpm run build   # once per checkout; rerun after pulling new commits
+```
+
+Register the agent server in Zed `settings.json`; the key may instead live in your shell environment outside the `env` block:
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek Harness": {
+      "type": "custom",
+      "command": "pnpm",
+      "args": ["-C", "/absolute/path/to/deepseek-harness-zed-acp", "dsh", "--profile", "acp"],
+      "env": { "DEEPSEEK_API_KEY": "sk-your-key-here" }
+    }
+  }
+}
+```
+
+The first Zed session auto-initializes the profile under `~/.dsh/profiles/acp` and authenticates against the key. See [Use DeepSeek Harness in Zed](docs/user/guide/zed-acp.md) for modes, presets, permissions, session history, and troubleshooting.
+
+-----
+
 DeepSeek Harness (`dsh`) is an open-source agent harness developed by [DeepSeek AI](https://deepseek.com).
 
 It is built on an **everything-is-a-plugin** architecture and powered by [Cordis](https://github.com/cordiverse/cordis), whose design is described in [_A Programming Paradigm for Spatiotemporal Composability_](https://arxiv.org/abs/2608.25512).
