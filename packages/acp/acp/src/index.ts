@@ -42,18 +42,27 @@ import {
   type ResumeSessionResponse,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
+  type SetSessionModeRequest,
+  type SetSessionModeResponse,
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
-// Side-effect type import: declaration-merges the approval waterfall answered below.
+// Side-effect type imports: declaration-merge the approval waterfall answered
+// below and the user-questions waterfall the questions bridge answers.
 import type {} from '@deepseek-ai/dsh-user-approval'
+import type {} from '@deepseek-ai/dsh-user-questions'
+import { authenticate as authenticateCredential, acpAuthMethods, resolveApiKeyRef } from './auth.ts'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
+import { AcpPermissionConfigError } from './permission-control.ts'
+import { AcpPresetConfigError } from './preset-control.ts'
+import { bridgeAcpQuestions } from './questions.ts'
 import { AcpSession } from './session.ts'
+import { ACP_AGENT_VERSION } from './version.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
 
@@ -77,6 +86,12 @@ export interface AcpConfig {
   provider?: string
   /** Model name for created agents. */
   model?: string
+  /**
+   * Credential reference `authenticate` validates; must name the same
+   * environment variable the composed LLM provider resolves its key from
+   * (the DeepSeek provider's default).
+   */
+  apiKeyEnv?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
   /** Runtime-only transport override; production uses stdio. */
@@ -86,6 +101,7 @@ export interface AcpConfig {
 export const Config: Schema<AcpConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
+  apiKeyEnv: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
 })
 
@@ -100,6 +116,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const persistence = ctx.sessionPersistence
   const logger = ctx.logger
   const sessionListPageSize = resolveSessionListPageSize(config.sessionListPageSize)
+  // A malformed reference fails at load, before any client can authenticate.
+  const apiKeyRef = resolveApiKeyRef(config.apiKeyEnv)
   const sessions = new Map<SessionId, AcpSession>()
   const activating = new Set<SessionId>()
   let closed = false
@@ -172,6 +190,21 @@ export function apply(ctx: Context, config: AcpConfig): void {
     })
   })
 
+  // Structured questions (plan review, ask_user_question) ride the same
+  // permission channel; unrepresentable questions delegate to the waterfall.
+  ctx.on('user-questions/request', (request, next) => {
+    const record = request.agent === undefined ? undefined : ownedRecord(request.agent)
+    if (record === undefined) return next()
+    return bridgeAcpQuestions({
+      sessionId: record.agent.session.id,
+      drainUpdates: () => record.drainUpdates(),
+      requestPermission: (params, signal) =>
+        conn.request(methods.client.session.requestPermission, params,
+          signal === undefined ? undefined : { cancellationSignal: signal }),
+      warn: (message) => { logger.warn(message) },
+    }, request, next)
+  })
+
   const implementation = {
     async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
       // Single-version agent: the spec's "same version if supported, else
@@ -179,28 +212,24 @@ export function apply(ctx: Context, config: AcpConfig): void {
       imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
       return {
         protocolVersion: PROTOCOL_VERSION,
-        agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
+        agentInfo: { name: 'deepseek-harness-acp', version: ACP_AGENT_VERSION },
         agentCapabilities: {
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
           sessionCapabilities: { close: {}, list: {}, resume: {} },
         },
-        authMethods: [],
+        authMethods: acpAuthMethods(),
       }
     },
 
-    authenticate(_params: AuthenticateRequest): Promise<void> {
-      return Promise.resolve()
+    async authenticate(params: AuthenticateRequest): Promise<void> {
+      await authenticateCredential(ctx, apiKeyRef, params.methodId)
     },
 
     async newSession(params: NewSessionRequest, signal: AbortSignal): Promise<NewSessionResponse> {
       assertOpen()
       validateWorkspaceParams(params)
       const sessionId = brandString<SessionId>(randomUUID())
-      // No preset composition: the ACP bundle keeps the model-facing rows in
-      // the host plane, so this agent reads them from the global layer. A
-      // deployment that configures a roster has to join one here first
-      // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
       let record: AcpSession
       try {
         record = await AcpSession.create(ctx, {
@@ -224,10 +253,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
       sessions.set(sessionId, record)
       try {
         const configOptions = await record.configOptions(signal)
+        const modes = record.modesState()
         assertOpen()
         await persistence.ensureMaterialized(record.agent.session)
         assertOpen()
-        return { sessionId, configOptions }
+        return { sessionId, ...(modes === undefined ? {} : { modes }), configOptions }
       } catch (error: unknown) {
         sessions.delete(sessionId)
         await record.close('session/new activation failed')
@@ -279,7 +309,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
         }
         sessions.set(sessionId, record)
         try {
-          return { configOptions: await record.configOptions(signal) }
+          const configOptions = await record.configOptions(signal)
+          const modes = record.modesState()
+          return { ...(modes === undefined ? {} : { modes }), configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)
           await record.close('session/resume option discovery failed')
@@ -338,8 +370,26 @@ export function apply(ctx: Context, config: AcpConfig): void {
       try {
         return { configOptions: await record.setConfig(params.configId, params.value, signal) }
       } catch (error: unknown) {
-        if (error instanceof AcpModelConfigError) throw invalidParams(error.message)
+        if (
+          error instanceof AcpModelConfigError
+          || error instanceof AcpPresetConfigError
+          || error instanceof AcpPermissionConfigError
+        ) {
+          throw invalidParams(error.message)
+        }
         throw error
+      }
+    },
+
+    setSessionMode(params: SetSessionModeRequest): SetSessionModeResponse {
+      assertOpen()
+      const record = requireSession(brandString<SessionId>(params.sessionId))
+      try {
+        record.setMode(params.modeId)
+        return {}
+      } catch (error: unknown) {
+        if (error instanceof RequestError) throw error
+        throw internalError(`mode selection failed: ${errorChain(error)}`)
       }
     },
 
@@ -374,7 +424,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
     Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
     Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
   )
+  // The SDK dispatches every incoming message through the handler chain in
+  // registration order, so each registered method adds one dispatch hop to
+  // every message behind it. Cancellation is the latency-critical direction
+  // and must not drift as methods are added: register it first.
   const app = createAcpAgentApp({ name: 'deepseek-harness-acp' })
+    .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
     .onRequest(methods.agent.initialize, ({ params }) => implementation.initialize(params))
     .onRequest(methods.agent.authenticate, async ({ params }) => {
       await implementation.authenticate(params)
@@ -385,8 +440,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.resume, ({ params, signal }) => implementation.resumeSession(params, signal))
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
+    .onRequest(methods.agent.session.setMode, ({ params }) => implementation.setSessionMode(params))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
-    .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
   const connection = app.connect(stream)
   const conn: AgentContext = connection.client
 

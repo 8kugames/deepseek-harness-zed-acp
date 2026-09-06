@@ -23,9 +23,15 @@ import type { ImageAttachmentLimits, ImageAttachmentRef, SaveImageAttachment, St
 import { type GenerateOptions, LlmAdapter, ReasoningEffortId, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-presets'
+import type { AgentPresetRow } from '@deepseek-ai/dsh-agent-presets/types'
+import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
+import { PlanModeController } from '@deepseek-ai/dsh-plan-mode'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { UserQuestionService } from '@deepseek-ai/dsh-user-questions'
 import * as AcpPlugin from '../src/index.ts'
 import type { AcpConfig } from '../src/index.ts'
 
@@ -115,6 +121,144 @@ const IMAGE_LIMITS: ImageAttachmentLimits = {
   mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
 }
 
+/**
+ * Minimal roster stand-in: one fixed two-preset roster with the mount, select,
+ * and recorded-composition reads the bridge consumes. Single-current, because
+ * the bridge wiring tests drive one session at a time.
+ */
+export class StubAgentPresets {
+  static readonly USABLE = ['standard', 'minimal']
+
+  current: string | undefined = 'standard'
+  /** The id `resolve()` falls back to; the real roster reads this from config. */
+  default = 'standard'
+  readonly mounted: (string | undefined)[] = []
+  readonly selected: string[] = []
+  /** When set, the next `select` rejects with this failure. */
+  selectFailure: RemoteError | undefined
+  /** Per-agent plan-mode state, standing in for the preset realm's controller. */
+  readonly realmPlanModes = new Map<unknown, StubRealmPlanMode>()
+
+  private row(id: string, extra: Partial<AgentPresetRow> = {}): AgentPresetRow {
+    return { id, trust: 'system', isDefault: id === 'standard', ...extra }
+  }
+
+  async resolve(id?: string): Promise<AgentPresetRow> {
+    if (id !== undefined && !StubAgentPresets.USABLE.includes(id)) {
+      throw new RemoteError('agent-preset/not-found', `preset "${id}" not found`, { agentPreset: id, available: StubAgentPresets.USABLE })
+    }
+    return this.row(id ?? this.default)
+  }
+
+  async mount(_agentCtx: unknown, id?: string): Promise<AgentPresetRow> {
+    const preset = await this.resolve(id)
+    this.mounted.push(preset.id)
+    this.current = preset.id
+    return preset
+  }
+
+  composedPreset(): string | undefined {
+    return this.current
+  }
+
+  /**
+   * The per-agent realm read the real roster serves from the preset's
+   * entry-local isolate: the mounted composition's own plan-mode instance,
+   * invisible to the agent's scope context.
+   */
+  serviceFor(agent: unknown, name: string): StubRealmPlanMode | undefined {
+    if (name !== 'planMode') return undefined
+    let state = this.realmPlanModes.get(agent)
+    if (state === undefined) {
+      state = new StubRealmPlanMode()
+      this.realmPlanModes.set(agent, state)
+    }
+    return state
+  }
+
+  async list(): Promise<AgentPresetRow[]> {
+    return [
+      this.row('standard', { name: 'Standard' }),
+      this.row('minimal', { name: 'Minimal', description: 'Two tools' }),
+      this.row('broken', { broken: 'composition failed' }),
+    ]
+  }
+
+  async select(_agent: unknown, id: string): Promise<string> {
+    if (this.selectFailure !== undefined) throw this.selectFailure
+    if (!StubAgentPresets.USABLE.includes(id)) {
+      throw new RemoteError('agent-preset/not-found', `preset "${id}" not found`, { agentPreset: id, available: StubAgentPresets.USABLE })
+    }
+    this.selected.push(id)
+    this.current = id
+    return id
+  }
+}
+
+/**
+ * Minimal plan-mode stand-in for the preset realm: the same get/set surface
+ * the bridge consumes, tracked per agent by {@link StubAgentPresets.serviceFor}.
+ */
+export class StubRealmPlanMode {
+  active = false
+  readonly setCalls: boolean[] = []
+
+  get(): { active: boolean } {
+    return { active: this.active }
+  }
+
+  set(_agent: unknown, active: boolean): void {
+    this.active = active
+    this.setCalls.push(active)
+  }
+}
+
+/**
+ * Minimal permission-preset stand-in: the shipped three-preset table with a
+ * per-session current value, mirroring the composed workspace-write default.
+ */
+export class StubPermissionPresets {
+  static readonly TABLE = ['read-only', 'workspace-write', 'danger-full-access']
+
+  private readonly currentBySession = new Map<unknown, string>()
+
+  current(session: unknown): string {
+    return this.currentBySession.get(session) ?? 'workspace-write'
+  }
+
+  get names(): readonly string[] {
+    return StubPermissionPresets.TABLE
+  }
+
+  optionOf(name: string): { value: string; name: string; description?: string } {
+    const descriptions: Record<string, string> = {
+      'read-only': 'Read-only inspection.',
+      'workspace-write': 'Write inside the workspace.',
+      'danger-full-access': 'Full access without approval prompts.',
+    }
+    const known = StubPermissionPresets.TABLE.includes(name)
+    return {
+      value: name,
+      name,
+      ...descriptions[name] === undefined ? { description: 'Current settings match no preset.' } : { description: descriptions[name] },
+      ...known ? {} : { name: 'Custom' },
+    }
+  }
+
+  set(session: unknown, name: string): void {
+    if (!StubPermissionPresets.TABLE.includes(name)) {
+      throw new Error(`permission: unknown preset "${name}" (known: ${StubPermissionPresets.TABLE.join(', ')})`)
+    }
+    this.currentBySession.set(session, name)
+  }
+}
+
+/** The stub cast the bridge consumes; service typing stays on the real class. */
+export interface BridgeHarnessPresets {
+  /** The stub's membership state, for assertions. */
+  readonly stub: StubAgentPresets
+}
+
 /** In-memory durable store for ACP wire-order and lifecycle tests. */
 class MemoryAttachmentStore extends AttachmentStore {
   readonly imageLimits = IMAGE_LIMITS
@@ -191,6 +335,7 @@ interface BridgeClient {
   resumeSession: NonNullable<AcpAgent['resumeSession']>
   closeSession: NonNullable<AcpAgent['closeSession']>
   setSessionConfigOption: NonNullable<AcpAgent['setSessionConfigOption']>
+  setSessionMode: NonNullable<AcpAgent['setSessionMode']>
   prompt: (params: PromptRequest, options?: SendRequestOptions) => Promise<PromptResponse>
   cancel: NonNullable<AcpAgent['cancel']>
 }
@@ -202,6 +347,10 @@ export interface BridgeHarness {
   attachments: MemoryAttachmentStore | undefined
   updates: CapturedUpdate[]
   sessionUpdates: { sessionId: string; update: CapturedUpdate }[]
+  /** The mounted stub roster; undefined unless the harness option mounted one. */
+  presets: StubAgentPresets | undefined
+  /** The mounted stub permission service; undefined unless the option mounted one. */
+  permissions: StubPermissionPresets | undefined
   permissionRequests: RequestPermissionRequest[]
   persistenceRoot: string
   onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse
@@ -226,6 +375,14 @@ export async function makeBridgeHarness(options: {
   imageCapable?: boolean
   attachments?: boolean
   persistenceRoot?: string
+  /** Mount the plan-mode service, as the shipped dsh-base bundle does. */
+  planMode?: boolean
+  /** Mount the user-questions service, as the shipped dsh-base bundle does. */
+  userQuestions?: boolean
+  /** Mount the stub preset roster, as the shipped acp bundle does. */
+  presets?: boolean
+  /** Mount the stub permission-preset service, as the shipped dsh-base bundle does. */
+  permissions?: boolean
 } = {}): Promise<BridgeHarness> {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
@@ -239,6 +396,18 @@ export async function makeBridgeHarness(options: {
   await ctx.plugin(JsonlSessionPersistence, { root: persistenceRoot, compression: 'none' })
   await ctx.plugin(TokenMeter)
   if (options.attachments !== false) await ctx.plugin(MemoryAttachmentStore)
+  if (options.planMode === true) {
+    await ctx.plugin(PlanModeController, { section: 'Test plan guidance: stay in plan mode.' })
+  }
+  if (options.userQuestions === true) await ctx.plugin(UserQuestionService)
+  const stubPresets = options.presets === true ? new StubAgentPresets() : undefined
+  if (stubPresets !== undefined) {
+    ctx.provide('agentPresets', stubPresets as never)
+    // The real roster registers this projection on activation; the stub cannot.
+    ctx.sessionProjections.register(agentPresetProjectionDefinition)
+  }
+  const stubPermissions = options.permissions === true ? new StubPermissionPresets() : undefined
+  if (stubPermissions !== undefined) ctx.provide('permissionPresets', stubPermissions as unknown as PermissionPresetService)
   const loopFiber = await ctx.plugin(AgentLoop, { agents: [] })
   const primaryAdapter = ctx.llm.registerAdapter(['mock'], adapter)
 
@@ -261,6 +430,8 @@ export async function makeBridgeHarness(options: {
     updates,
     sessionUpdates,
     permissionRequests,
+    presets: stubPresets,
+    permissions: stubPermissions,
     persistenceRoot,
     onPermission: () => ({ outcome: { outcome: 'cancelled' } }),
     onSessionUpdateError: undefined,
@@ -307,6 +478,7 @@ export async function makeBridgeHarness(options: {
     resumeSession: params => client.request(methods.agent.session.resume, params),
     closeSession: params => client.request(methods.agent.session.close, params),
     setSessionConfigOption: params => client.request(methods.agent.session.setConfigOption, params),
+    setSessionMode: params => client.request(methods.agent.session.setMode, params),
     prompt: (params, options) => client.request(methods.agent.session.prompt, params, options),
     cancel: params => client.notify(methods.agent.session.cancel, params),
   }

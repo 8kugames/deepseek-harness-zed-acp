@@ -1,0 +1,15 @@
+{
+  "id": "deepseek-harness",
+  "name": "DeepSeek Harness",
+  "version": "0.1.3-alpha.1",
+  "description": "DeepSeek Harness coding agent over the Agent Client Protocol: persistent sessions, plan mode, tool permissions, and MCP support, driven by the dsh --profile acp server.",
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "authors": ["DeepSeek <agent@deepseek.com>"],
+  "license": "MIT",
+  "distribution": {
+    "npx": {
+      "package": "@deepseek-ai/dsh@0.1.3-alpha.1",
+      "args": ["--profile", "acp"]
+    }
+  }
+}

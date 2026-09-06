@@ -35,6 +35,8 @@
   },
   "dependencies": {
     "@deepseek-ai/dsh-acp": "workspace:^",
+    "@deepseek-ai/dsh-agent-presets": "workspace:^",
+    "@deepseek-ai/dsh-tool-subagent": "workspace:^",
     "@deepseek-ai/dsh-cmdline": "workspace:^",
     "commander": "^15.0.0"
   },

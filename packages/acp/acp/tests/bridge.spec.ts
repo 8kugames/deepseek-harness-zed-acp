@@ -8,6 +8,8 @@ import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import { ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { acpAuthMethods } from '../src/auth.ts'
+import { ACP_AGENT_VERSION } from '../src/version.ts'
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
 import { startHttpMcpFixture } from '../../../mcp/mcp-client/tests/http-fixture.ts'
 
@@ -30,6 +32,7 @@ describe('automation-only ACP bridge', () => {
   afterEach(async () => {
     await harness?.dispose()
     harness = undefined
+    delete process.env.ACP_BRIDGE_AUTH_KEY
   })
 
   it('advertises the standard automation controls without private metadata', async () => {
@@ -41,13 +44,13 @@ describe('automation-only ACP bridge', () => {
 
     expect(response).toEqual({
       protocolVersion: PROTOCOL_VERSION,
-      agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
+      agentInfo: { name: 'deepseek-harness-acp', version: ACP_AGENT_VERSION },
       agentCapabilities: {
         mcpCapabilities: { http: true },
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
         sessionCapabilities: { close: {}, list: {}, resume: {} },
       },
-      authMethods: [],
+      authMethods: acpAuthMethods(),
     })
   })
 
@@ -62,11 +65,13 @@ describe('automation-only ACP bridge', () => {
     expect(noStore.agentCapabilities?.promptCapabilities?.image).toBe(false)
   })
 
-  it('negotiates an unsupported version and accepts the required no-op authentication call', async () => {
-    harness = await makeBridgeHarness()
+  it('negotiates an unsupported version and authenticates the advertised method', async () => {
+    harness = await makeBridgeHarness({ config: { apiKeyEnv: 'ACP_BRIDGE_AUTH_KEY' } })
     const response = await harness.client.initialize({ protocolVersion: 0, clientCapabilities: {} })
     expect(response.protocolVersion).toBe(PROTOCOL_VERSION)
-    await expect(harness.client.authenticate({ methodId: 'unused' })).resolves.toEqual({})
+    process.env.ACP_BRIDGE_AUTH_KEY = 'sk-bridge-test-key'
+    await expect(harness.client.authenticate({ methodId: 'deepseek-api-key' })).resolves.toEqual({})
+    await expect(harness.client.authenticate({ methodId: 'unused' })).rejects.toThrow(/unknown authentication method/)
   })
 
   it('creates a session, emits one committed answer, and settles the prompt', async () => {
@@ -598,6 +603,38 @@ describe('automation-only ACP bridge', () => {
     expect(harness.adapter.requests[0]?.reasoningEffort).toBe('low')
   })
 
+  it('returns every composed option after model and reasoning selections', async () => {
+    harness = await makeBridgeHarness({ presets: true, permissions: true, script: [] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const reasoning = created.configOptions?.find(option => option.id === 'reasoning_effort')
+    if (reasoning?.type !== 'select') throw new Error('expected a reasoning select option')
+    const low = reasoning.options.find(option => !('group' in option) && option.name === 'Low')
+    if (low === undefined || 'group' in low) throw new Error('expected Low reasoning effort')
+
+    const reselected = await harness.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'reasoning_effort',
+      value: low.value,
+    })
+    expect(reselected.configOptions.map(option => option.id))
+      .toEqual(['preset', 'permission', 'model', 'reasoning_effort'])
+
+    const model = created.configOptions?.find(option => option.id === 'model')
+    if (model?.type !== 'select') throw new Error('expected a model select option')
+    const plain = model.options.flatMap(option => 'group' in option ? option.options : [option])
+      .find(option => option.name === 'Mock Plain')
+    if (plain === undefined) throw new Error('expected Mock Plain')
+
+    const switched = await harness.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'model',
+      value: plain.value,
+    })
+    expect(switched.configOptions.map(option => option.id))
+      .toEqual(['preset', 'permission', 'model'])
+  })
+
   it('rejects unknown config choices without changing the selected route', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('unchanged')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
@@ -776,7 +813,7 @@ describe('automation-only ACP bridge', () => {
     const invalidLists = [
       [stdio, stdio],
       [{ ...stdio, name: '   ' }],
-      [{ ...stdio, command: 'node' }],
+      [{ ...stdio, command: 'nowhere-to-be-found' }],
       [{ ...stdio, env: [{ name: 'BAD=NAME', value: 'x' }] }],
       [{ type: 'http' as const, name: 'web', url: 'file:///tmp/mcp', headers: [] }],
       [{ type: 'http' as const, name: 'web', url: 'https://example.test/mcp', headers: [{ name: 'bad header', value: 'x' }] }],

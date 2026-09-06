@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { delimiter, resolve } from 'node:path'
 import type { McpServer } from '@agentclientprotocol/sdk'
 import type { Config as McpClientConfig } from '@deepseek-ai/dsh-mcp-client'
 import { mountAcpMcpServers } from '../src/mcp.ts'
@@ -112,5 +115,40 @@ describe('ACP MCP declaration mapping', () => {
 
     await expect(mountAcpMcpServers(ctx, [malformed], process.cwd()))
       .rejects.toThrow(/mcpServers\[0\] is invalid/)
+  })
+
+  it('resolves a bare command against a PATH directory the MCP child inherits', async () => {
+    const directory = await mkdtemp(resolve(tmpdir(), 'dsh-acp-mcp-path-'))
+    const executable = resolve(directory, 'fixture-mcp-server')
+    await writeFile(executable, '#!/bin/sh\nexit 0\n')
+    await chmod(executable, 0o755)
+    const originalPath = process.env.PATH
+    process.env.PATH = `${directory}${delimiter}${originalPath ?? ''}`
+    const { ctx, configs } = captureContext()
+
+    try {
+      await mountAcpMcpServers(ctx, [{
+        name: 'fixture', command: 'fixture-mcp-server', args: [], env: [],
+      }], process.cwd())
+    } finally {
+      process.env.PATH = originalPath
+      await rm(directory, { recursive: true, force: true })
+    }
+
+    expect(configs[0]).toMatchObject({ transport: 'stdio', command: executable })
+  })
+
+  it('rejects a bare command that no PATH directory provides', async () => {
+    const { ctx } = captureContext()
+    const originalPath = process.env.PATH
+    process.env.PATH = ''
+
+    try {
+      await expect(mountAcpMcpServers(ctx, [{
+        name: 'fixture', command: 'nowhere-to-be-found', args: [], env: [],
+      }], process.cwd())).rejects.toThrow(/names no executable on the harness PATH: nowhere-to-be-found/)
+    } finally {
+      process.env.PATH = originalPath
+    }
   })
 })

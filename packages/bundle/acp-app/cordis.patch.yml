@@ -8,6 +8,123 @@
 - id: session-title-llm
   disabled: true
 
+# The preset roster owns the model-facing rows below once this bundle mounts
+# it; the same rows stay host-plane in rosterless deployments. The disable
+# list mirrors the web bundle's takeover: what a preset chooses is which of
+# these rows its agent sees at all. The reasoning for each plane decision has
+# its one home in the web bundle's patch and the host-plane-ownership note.
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: tool-str-replace-editor
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+- id: command-goal
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: workflow-worker-thread
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
+
+# The preset roster: shipped presets arrive with the package
+# (`includeShippedRoot`), user-authored ones live under
+# `$DSH_HOME/.agent-presets` (`includeUserRoot`), and `default: standard`
+# composes every session that names no preset.
+# The acp deployment owns its permission display copy: the `name` and
+# `description` fields are what the ACP `permission` select shows (Zed has no
+# client-side locale dictionary), so this row restates the base table with the
+# product labels. The preset ids, sandbox, and approval knobs match the base
+# row; the composed default stays workspace-write + ask.
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+        name: 仅可查看
+        description: 只读检查：可以查看与检索，不写入文件、不执行有副作用的命令。
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+        name: 工作区内修改
+        description: 可以在工作区内修改文件并执行命令；工作区之外的操作需要逐条审批。
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+        name: 完全权限
+        description: 完整的文件访问与命令执行，不弹出审批；仅在你信任当前任务时使用。
+
+- insert:
+    # Host-owned opt-in the preset delegation tools sample when a session
+    # receives its `subagent` rows; `@deepseek-ai/dsh-tool-subagent` resolves
+    # it from the Host scope. Same host row the web bundle mounts.
+    - id: subagent-model-selection-settings
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
 - insert:
     - id: acp-app-startup
       name: '@deepseek-ai/dsh-acp-app'

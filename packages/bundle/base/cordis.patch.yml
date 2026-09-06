@@ -239,12 +239,15 @@
           read-only:
             sandbox: read-only
             approval: ask
+            name: Read Only
           workspace-write:
             sandbox: workspace-write
             approval: ask
+            name: Workspace Write
           danger-full-access:
             sandbox: danger-full-access
             approval: never
+            name: Full access
 
     - id: shell-env
       name: '@deepseek-ai/dsh-shell-env'

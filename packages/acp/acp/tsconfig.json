@@ -24,7 +24,22 @@
       "path": "../../core/agent"
     },
     {
+      "path": "../../preset/agent-presets"
+    },
+    {
       "path": "../../attachment/attachment"
+    },
+    {
+      "path": "../../credentials/credentials"
+    },
+    {
+      "path": "../../interaction/permission-presets"
+    },
+    {
+      "path": "../../interaction/user-approval"
+    },
+    {
+      "path": "../../interaction/user-questions"
     },
     {
       "path": "../../llm/llm"
@@ -36,10 +51,16 @@
       "path": "../../mcp/mcp-client"
     },
     {
+      "path": "../../plan/plan-mode"
+    },
+    {
       "path": "../../session/session-persistence"
     },
     {
-      "path": "../../interaction/user-approval"
+      "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../util/launch-environment"
     }
   ]
 }

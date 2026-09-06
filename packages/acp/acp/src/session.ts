@@ -7,16 +7,23 @@ import {
   type PromptRequest,
   type PromptResponse,
   type SessionConfigOption,
+  type SessionModeState,
   type SessionNotification,
   type StopReason,
 } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { AgentPresets } from '@deepseek-ai/dsh-agent-presets'
+import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
+import type {} from '@deepseek-ai/dsh-session-projection'
+import type { PlanModeController } from '@deepseek-ai/dsh-plan-mode'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
+import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
+import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
 import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
@@ -66,6 +73,32 @@ function invalidParams(detail: string): RequestError {
   return RequestError.invalidParams(undefined, detail)
 }
 
+/** The advertised default mode id. */
+export const DEFAULT_MODE_ID = 'default'
+
+/** The advertised plan-mode id, backed by the plan-mode service. */
+export const PLAN_MODE_ID = 'plan'
+
+const DEFAULT_MODE = {
+  id: DEFAULT_MODE_ID,
+  name: 'Default',
+  description: 'Full editing and execution tools.',
+} as const
+
+const PLAN_MODE = {
+  id: PLAN_MODE_ID,
+  name: 'Plan',
+  description: 'Read-only exploration that ends in a plan for review.',
+} as const
+
+/** Build the advertised mode state from the plan-mode service's current selection. */
+function modeState(planMode: PlanModeController, agent: Agent): SessionModeState {
+  return {
+    currentModeId: planMode.get(agent).active ? PLAN_MODE_ID : DEFAULT_MODE_ID,
+    availableModes: [DEFAULT_MODE, PLAN_MODE],
+  }
+}
+
 /** Standard internal failure with protocol-safe detail. */
 function internalError(detail: string): RequestError {
   return RequestError.internalError(undefined, detail)
@@ -109,13 +142,23 @@ export class AcpSession {
     handle: AgentHandle,
     modelControl: AcpModelControl,
     private readonly notify: (notification: SessionNotification) => Promise<void>,
+    private readonly presets: AgentPresets | undefined,
+    permissions: PermissionPresetService | undefined,
   ) {
     this.agent = handle.agent
     this.modelControl = modelControl
+    this.presetControl = presets === undefined
+      ? undefined
+      : new AcpPresetControl(presets, this.agent)
+    this.permissionControl = permissions === undefined
+      ? undefined
+      : new AcpPermissionControl(permissions, this.agent.session)
     this.disposeAgent = () => handle.dispose()
   }
 
   private readonly disposeAgent: () => Promise<void>
+  private readonly presetControl: AcpPresetControl | undefined
+  private readonly permissionControl: AcpPermissionControl | undefined
 
   /**
    * Compose a fresh Agent and all requested MCP clients before publication.
@@ -124,27 +167,33 @@ export class AcpSession {
    * @returns the fully composed per-session module.
    */
   static async create(ctx: Context, options: CreateAcpSessionOptions): Promise<AcpSession> {
+    const presets = ctx.get('agentPresets')
+    const agentPreset = presets === undefined ? undefined : (await presets.resolve()).id
     const modelControl = new AcpModelControl(ctx.llm, options.fallbackSelection)
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
-      meta: { cwd: options.cwd },
+      // The header records the composition this session starts under, so a
+      // resume rejoins it rather than the roster's then-current default.
+      meta: { cwd: options.cwd, ...(agentPreset === undefined ? {} : { agentPreset }) },
       agentOptions: options.agentOptions,
       signal: options.signal,
       setup: async (agentCtx) => {
         modelControl.install(agentCtx)
+        if (presets !== undefined) await presets.mount(agentCtx, agentPreset)
         await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
       },
     })
-    return new AcpSession(ctx, handle, modelControl, options.notify)
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'))
   }
 
   /**
    * Restore a persisted Agent and compose the request's fresh MCP connections.
    * @param ctx - ACP plugin context with Agent, LLM, and persistence services.
-   * @param options - persisted identity, workspace, fallback route, MCP, and notifier.
+   * @param options - persisted identity, fallback route, MCP, and notifier.
    * @returns the restored per-session module.
    */
   static async resume(ctx: Context, options: ResumeAcpSessionOptions): Promise<AcpSession> {
+    const presets = ctx.get('agentPresets')
     let modelControl: AcpModelControl | undefined
     const handle = await ctx.agents.resume({
       resumeSessionId: options.sessionId,
@@ -159,6 +208,14 @@ export class AcpSession {
           selectionFor(agent.session.requestHeader(), options.fallbackSelection),
         )
         modelControl.install(agentCtx)
+        if (presets !== undefined) {
+          // The session log states the composition this session ran under;
+          // a session recorded before a roster existed joins the default.
+          const projections = ctx.get('sessionProjections')
+          const recorded = projections?.stateOf(agent.session, 'agentPreset') ?? undefined
+          const preset = await presets.resolve(typeof recorded === 'string' ? recorded : undefined)
+          await presets.mount(agentCtx, preset.id)
+        }
         await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
       },
     })
@@ -168,7 +225,7 @@ export class AcpSession {
       throw internalError('session/resume did not compose model selection')
     }
     /* v8 ignore stop */
-    return new AcpSession(ctx, handle, modelControl, options.notify)
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'))
   }
 
   /**
@@ -190,31 +247,84 @@ export class AcpSession {
   }
 
   /**
-   * Return the complete standard model configuration state.
-   * @param signal - optional request cancellation.
-   * @returns provider-grouped model and exact-model reasoning options.
+   * Return the complete standard configuration state: the preset select when
+   * the deployment composes a roster, the permission select when it composes
+   * the permission service, then the model selections.
+   * @param signal - optional catalog and exact-model cancellation.
+   * @returns all current configuration options.
    */
-  configOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
+  async configOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
     this.assertActive()
-    return this.modelControl.options(signal)
+    const presetOption = this.presetControl === undefined ? undefined : await this.presetControl.option()
+    const permissionOption = this.permissionControl === undefined ? undefined : this.permissionControl.option()
+    const modelOptions = await this.modelControl.options(signal)
+    return [
+      ...(presetOption === undefined ? [] : [presetOption]),
+      ...(permissionOption === undefined ? [] : [permissionOption]),
+      ...modelOptions,
+    ]
   }
 
   /**
    * Apply one standard configuration option to later ACP turns.
    * @param configId - advertised standard option id.
    * @param value - selected standard option value.
-   * @param signal - optional request cancellation.
+   * @param signal - optional catalog and exact-model cancellation.
    * @returns the complete resulting option state.
    */
-  setConfig(configId: string, value: unknown, signal?: AbortSignal): Promise<SessionConfigOption[]> {
+  async setConfig(configId: string, value: unknown, signal?: AbortSignal): Promise<SessionConfigOption[]> {
     this.assertActive()
-    return this.modelControl.set(configId, value, signal)
+    if (this.presetControl !== undefined && configId === PRESET_CONFIG_ID) {
+      await this.presetControl.set(value)
+    } else if (this.permissionControl !== undefined && configId === PERMISSION_CONFIG_ID) {
+      this.permissionControl.set(value)
+    } else {
+      await this.modelControl.set(configId, value, signal)
+    }
+    return this.configOptions(signal)
+  }
+
+  /**
+   * The plan-mode service of this session's own composition. A preset-joined
+   * Agent resolves the roster's realm instance — its scope context cannot see
+   * an entry-local realm — and a rosterless deployment falls back to the host
+   * plane.
+   * @returns the plan-mode service, or `undefined` when neither composes one.
+   */
+  private planMode(): PlanModeController | undefined {
+    return this.presets?.serviceFor(this.agent, 'planMode') ?? this.agent.ctx.get('planMode')
+  }
+
+  /**
+   * Return the session-mode state, or `undefined` when this session's
+   * composition provides no plan-mode service.
+   * @returns the current mode and the two fixed options.
+   */
+  modesState(): SessionModeState | undefined {
+    const planMode = this.planMode()
+    return planMode === undefined ? undefined : modeState(planMode, this.agent)
+  }
+
+  /**
+   * Select a session mode. A selection during an open turn queues in the
+   * plan-mode service until the next accepted pre-step; the committed change
+   * reaches the client as a `current_mode_update` notification.
+   * @param modeId - one of the advertised mode ids.
+   */
+  setMode(modeId: string): void {
+    if (modeId !== DEFAULT_MODE_ID && modeId !== PLAN_MODE_ID) {
+      throw invalidParams(`unknown mode: ${modeId}`)
+    }
+    this.assertActive()
+    const planMode = this.planMode()
+    if (planMode === undefined) throw invalidParams('session modes are not available in this deployment')
+    planMode.set(this.agent, modeId === PLAN_MODE_ID)
   }
 
   /** Resolve topology state off-chain, then serialize its notification without blocking execution updates. */
   topologyChanged(): void {
     if (this.closing !== undefined) return
-    void this.modelControl.options()
+    void this.configOptions()
       .then((configOptions) => {
         if (this.closing !== undefined) return
         const previous = this.outputTail
@@ -367,6 +477,21 @@ export class AcpSession {
           /* v8 ignore start -- the bridge notifier contains transport rejection. */
           .catch((error: unknown) => {
             this.ctx.logger.warn(`acp: tool-call update delivery failed: ${errorChain(error)}`)
+          })
+        /* v8 ignore stop */
+      } else if (event.type === 'plan/mode') {
+        const previous = this.outputTail
+        this.outputTail = previous
+          .then(() => this.notify({
+            sessionId: this.agent.session.id,
+            update: {
+              sessionUpdate: 'current_mode_update',
+              currentModeId: event.data.active ? PLAN_MODE_ID : DEFAULT_MODE_ID,
+            },
+          }))
+          /* v8 ignore start -- the bridge notifier contains transport rejection. */
+          .catch((error: unknown) => {
+            this.ctx.logger.warn(`acp: mode update delivery failed: ${errorChain(error)}`)
           })
         /* v8 ignore stop */
       } else if (event.type === 'tool/result') {

@@ -2,8 +2,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
+import { accessSync, constants, statSync } from 'node:fs'
 import { validateHeaderName, validateHeaderValue } from 'node:http'
-import { isAbsolute } from 'node:path'
+import { delimiter, isAbsolute, resolve } from 'node:path'
 import type { McpServer } from '@agentclientprotocol/sdk'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 
@@ -42,14 +43,12 @@ function resolveMcpConfigs(servers: readonly McpServer[], sessionCwd: string): M
     }
     names.add(serverName)
     if (!('type' in server)) {
-      if (!isAbsolute(server.command)) {
-        throw new AcpMcpConfigError(`mcpServers[${index}].command must be an absolute path`)
-      }
+      const command = resolveStdioCommand(server.command, `mcpServers[${index}].command`)
       const env = entriesToRecord(server.env, `mcpServers[${index}].env`, 'environment')
       const config = validateClientConfig(index, () => McpClient.Config({
         transport: 'stdio',
         serverName,
-        command: server.command,
+        command,
         args: server.args,
         env,
         cwd: sessionCwd,
@@ -71,6 +70,51 @@ function resolveMcpConfigs(servers: readonly McpServer[], sessionCwd: string): M
     }
     throw new AcpMcpConfigError(`mcpServers[${index}] transport ${server.type} is not supported`)
   })
+}
+
+/**
+ * Resolve one stdio declaration to the absolute executable the client launches.
+ * The ACP spec names absolute commands, but editors such as Zed forward bare
+ * names (`npx`, `uvx`) for their configured MCP servers, so a bare name
+ * resolves against the harness process PATH — the exact environment the MCP
+ * child inherits — and an unresolvable name fails loudly with the searched
+ * command.
+ * @param command - the ACP stdio command string.
+ * @param field - the indexed declaration field for error messages.
+ * @returns the absolute executable path.
+ */
+function resolveStdioCommand(command: string, field: string): string {
+  if (isAbsolute(command)) return command
+  const resolved = lookupPathCommand(command)
+  if (resolved === undefined) {
+    throw new AcpMcpConfigError(
+      `${field} is not an absolute path and names no executable on the harness PATH: ${command}`,
+    )
+  }
+  return resolved
+}
+
+/** Find the first executable file matching a bare command name on the process PATH. */
+function lookupPathCommand(command: string): string | undefined {
+  const searchPath = process.env.PATH
+  if (searchPath === undefined || searchPath.length === 0) return undefined
+  // A bare `npx` on Windows is npx.cmd, so PATHEXT-style suffixes join the search.
+  const extensions = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat'] : ['']
+  for (const directory of searchPath.split(delimiter)) {
+    if (directory.length === 0) continue
+    for (const extension of extensions) {
+      const candidate = resolve(directory, command + extension)
+      try {
+        if (statSync(candidate).isFile()) {
+          accessSync(candidate, constants.X_OK)
+          return candidate
+        }
+      } catch {
+        /* absent, non-file, or not executable — keep searching the remaining directories. */
+      }
+    }
+  }
+  return undefined
 }
 
 /** Convert ordered ACP name/value entries without silently accepting duplicate keys. */

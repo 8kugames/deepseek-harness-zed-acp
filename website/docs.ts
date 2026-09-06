@@ -162,6 +162,14 @@ const homeAndGuide = pairedPages([
     section: { root: '集成', en: 'Integrations' },
     order: 1,
   },
+  {
+    source: 'docs/user/guide/zed-acp.md',
+    route: 'guide/zed-acp.md',
+    label: { root: 'Zed 集成', en: 'Zed integration' },
+    sidebar: { root: 'zh-guide', en: 'en-guide' },
+    section: { root: '集成', en: 'Integrations' },
+    order: 2,
+  },
 ])
 
 const develop = pairedPages([

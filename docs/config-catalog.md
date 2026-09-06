@@ -22,6 +22,12 @@ export interface AcpConfig {
   provider?: string
   /** Model name for created agents. */
   model?: string
+  /**
+   * Credential reference `authenticate` validates; must name the same
+   * environment variable the composed LLM provider resolves its key from
+   * (the DeepSeek provider's default).
+   */
+  apiKeyEnv?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
   /** Runtime-only transport override; production uses stdio. */
@@ -31,7 +37,7 @@ export interface AcpConfig {
 
 Depends on: `Stream` (`@agentclientprotocol/sdk`)
 
-Source: [`packages/acp/acp/src/index.ts:75`](../packages/acp/acp/src/index.ts)
+Source: [`packages/acp/acp/src/index.ts:84`](../packages/acp/acp/src/index.ts)
 
 <a id="deepseek-aidsh-agent-default-model"></a>
 
