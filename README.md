@@ -20,7 +20,7 @@ Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to t
 Until the first npm release ships, install from this repository (the ref names the branch carrying the plugin; point it at `master` once merged):
 
 ```sh
-dsh plugin --profile zed add "github:8kugames/deepseek-harness-zed-acp#zed-acp"
+dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
 Re-run the same `add` command to update an existing install — a profile restart alone does not pick up files the previously installed version did not ship (the preset declarations under `presets/` are one such addition).
@@ -29,10 +29,10 @@ Once `@8kugames/dsh-zed-acp` is published, the same package installs from the re
 
 ### Install from a local clone
 
-The committed `dist/` means a clone needs no build step. After `git clone https://github.com/8kugames/deepseek-harness-zed-acp.git`, install the clone through a pnpm symlink (a `link:` install reflects local edits on the next agent restart; `file:` copies and caches same-version tarballs instead):
+The `prepare` npm hook builds `dist/` during `npm install`, so a clone needs no separate build step. After `git clone https://github.com/8kugames/dsh-zed-acp.git`, install the clone through a pnpm symlink (a `link:` install reflects local edits on the next agent restart; `file:` copies and caches same-version tarballs instead):
 
 ```sh
-dsh plugin --profile zed add -w "link:/absolute/path/to/deepseek-harness-zed-acp"
+dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 ```
 
 For development on the clone itself — tests, typecheck, rebuilds — run `npm install` once, then the usual `npm run typecheck` / `npm test` / `npm run build`.

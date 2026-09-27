@@ -16,7 +16,7 @@
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.1.7-rc.2
-dsh plugin --profile zed add "github:8kugames/deepseek-harness-zed-acp#zed-acp"
+dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
 CLI 的 npm `latest` 标签可能落后于插件对应的版本，而且插件的兼容门会在安装时拒绝更旧的 dsh，所以上面的命令钉住了版本。git ref 指向携带插件的分支；插件的首个发布上线后，即可从 npm registry 以 `@8kugames/dsh-zed-acp` 安装。

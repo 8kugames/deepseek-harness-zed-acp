@@ -16,7 +16,7 @@ Install the CLI pinned to the version the plugin targets, add the Zed ACP plugin
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.1.7-rc.2
-dsh plugin --profile zed add "github:8kugames/deepseek-harness-zed-acp#zed-acp"
+dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
 The npm `latest` tag of the CLI may trail the version the plugin targets, and the plugin's compatibility gate refuses older dsh at install time, so the command above pins the version. The git ref names the branch that carries the plugin; the plugin installs from the npm registry as `@8kugames/dsh-zed-acp` once its first release ships.

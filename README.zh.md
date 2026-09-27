@@ -13,7 +13,7 @@
 在首个 npm 发布之前，直接从本仓库安装（ref 指向携带插件的分支；合并进 `master` 后改为 `master`）：
 
 ```sh
-dsh plugin --profile zed add "github:8kugames/deepseek-harness-zed-acp#zed-acp"
+dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
 重新执行同一条 `add` 命令即可更新已安装的插件——仅重启 profile 不会带来旧版本未携带的文件（`presets/` 下的预设声明就是这类新增）。
@@ -22,10 +22,10 @@ dsh plugin --profile zed add "github:8kugames/deepseek-harness-zed-acp#zed-acp"
 
 ### 从本地 clone 安装
 
-仓库已提交 `dist/`，clone 后无需构建。`git clone https://github.com/8kugames/deepseek-harness-zed-acp.git` 之后，用 pnpm 符号链接安装本克隆（`link:` 安装在下次重启 agent 时即反映本地修改；`file:` 则会复制并按版本缓存 tarball）：
+`npm install` 时的 `prepare` 钩子会自动构建 `dist/`，clone 后无需单独构建。`git clone https://github.com/8kugames/dsh-zed-acp.git` 之后，用 pnpm 符号链接安装本克隆（`link:` 安装在下次重启 agent 时即反映本地修改；`file:` 则会复制并按版本缓存 tarball）：
 
 ```sh
-dsh plugin --profile zed add -w "link:/absolute/path/to/deepseek-harness-zed-acp"
+dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 ```
 
 若要在克隆内做开发（测试、类型检查、重新构建），先执行一次 `npm install`，之后照常用 `npm run typecheck` / `npm test` / `npm run build`。
