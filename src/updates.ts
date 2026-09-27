@@ -23,6 +23,9 @@ const TOOL_KINDS: ReadonlyMap<string, ToolKind> = new Map([
   ['pwsh', 'execute'],
   ['run_code', 'execute'],
   ['terminal_send', 'execute'],
+  ['job_output', 'read'],
+  ['job_list', 'read'],
+  ['job_kill', 'execute'],
   ['web_search', 'fetch'],
   ['web_fetch', 'fetch'],
   ['exit_plan_mode', 'switch_mode'],
@@ -41,23 +44,43 @@ export function toolKindFor(name: string): ToolKind {
 const MAX_COMMAND_TITLE = 200
 
 /**
+ * Salient string argument fields, probed in order. Each mirrors a shipped
+ * tool's own `presentCall` intent (`bash`.command, `glob`/`grep`.pattern,
+ * `web_fetch`.url, `read`/`write`/`edit`.file_path, `subagent`.description);
+ * the `web_search` `queries` string array is probed separately below.
+ */
+const SALIENT_TITLE_FIELDS = ['command', 'pattern', 'url', 'file_path', 'description'] as const
+
+/**
  * Derive one tool call's human-readable ACP title from its committed fact.
  * ponytail: titles follow the tools' declared `presentCall` intent only where it
- * is recoverable from the committed event — an object argument with a string
- * `command` field (the terminal family: bash/pwsh), collapsed to one line and
- * capped. Any other shape falls back to the tool name; full presentation parity
- * would need registry access the pure event projection deliberately lacks.
+ * is recoverable from the committed event — the salient string argument fields
+ * above (plus `queries` arrays), collapsed to one line and capped, without the
+ * presenters' verb prefixes (the ACP `kind` icon carries the category). Any
+ * other shape falls back to the tool name; full presentation parity (verb
+ * titles, locations, structured result cards) would need registry access the
+ * pure event projection deliberately lacks.
  * @param name - committed DSH tool-call name.
  * @param rawArguments - raw `arguments` JSON string exactly as the model produced it.
- * @returns the salient command text when recognizable, otherwise the tool name.
+ * @returns the salient argument text when recognizable, otherwise the tool name.
  */
 function toolCallTitle(name: string, rawArguments: string): string {
   const parsed = parseToolArguments(rawArguments)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return name
-  const command = (parsed as Record<string, unknown>).command
-  if (typeof command !== 'string') return name
-  const oneLine = command.replace(/\s+/g, ' ').trim()
-  if (oneLine.length === 0) return name
+  const args = parsed as Record<string, unknown>
+  const salient: string[] = []
+  if (Array.isArray(args.queries)) {
+    const joined = args.queries
+      .filter((query): query is string => typeof query === 'string' && query.trim().length > 0)
+      .join(', ')
+    if (joined.length > 0) salient.push(joined)
+  }
+  for (const field of SALIENT_TITLE_FIELDS) {
+    const value = args[field]
+    if (typeof value === 'string' && value.trim().length > 0) salient.push(value)
+  }
+  if (salient.length === 0) return name
+  const oneLine = salient[0].replace(/\s+/g, ' ').trim()
   return oneLine.length > MAX_COMMAND_TITLE ? `${oneLine.slice(0, MAX_COMMAND_TITLE - 1)}…` : oneLine
 }
 
