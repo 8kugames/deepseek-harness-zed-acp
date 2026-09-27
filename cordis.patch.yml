@@ -1,0 +1,183 @@
+# @8kugames/dsh-zed-acp bundle patch — the layer `dsh plugin --profile zed add
+# @8kugames/dsh-zed-acp` contributes to a profile, applied after
+# `@deepseek-ai/dsh-base` and before the profile's own cordis.patch.yml.
+# Declared by package.json's `dsh.bundle.patch`.
+#
+#     dsh plugin --profile zed add @8kugames/dsh-zed-acp
+#     dsh --profile zed
+#
+# The bridge rides the profile's own composition — agents, adapters,
+# credentials, persistence (the shared $DSH_HOME/sessions store), sandbox,
+# tools, skills, subagents — and exposes it to Zed and other interactive ACP
+# clients. A dedicated `zed` profile composes this layer over dsh-base alone;
+# adding the plugin to the shipped `acp` profile also works: the two rows
+# below disable upstream's automation-only ACP transport so exactly one
+# server owns stdio. Rows absent from a dedicated profile warn and are
+# skipped, so the same layer serves both shapes.
+#
+# No session behavior is pinned beyond the product defaults: sessions inherit
+# the composition default (the model saved on the dsh Web UI Models page via
+# agent-default-model), and the model picker lists the live adapter
+# directory. DSH_MODEL / DSH_PERMISSION_MODE override per launch; permanent
+# overrides belong in the profile's cordis.patch.yml (id-targeted, last write
+# wins).
+
+- id: hmr
+  disabled: true
+
+# Newer dsh versions seed the acp profile with their own ACP transport.
+# This bundle owns stdout and must replace that transport.
+- id: acp
+  disabled: true
+
+- id: acp-app-startup
+  disabled: true
+
+- id: system-prompt
+  config:
+    personaSuffix: Your working directory is {{cwd}}.
+    personaPrefix: >-
+      You are a coding agent powered by the {{model}} model.
+
+# Model-facing tool rows move off the host plane and into each agent preset's
+# own composition (standard/ptc/minimal/cordis ship complete declarations
+# under `presets/`) — the same split the web-app bundle makes, and what gives
+# "minimal" its two-tool surface. Host-plane services (job/skill/goal
+# registries, shell-env, sandbox, approval, plan mode, the dynamic Cordis
+# runner the cordis preset injects) stay on the host and serve every preset.
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+- id: command-goal
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
+
+# The acp deployment owns its permission display copy: the `name` and
+# `description` fields are what the ACP `permission` select shows (Zed has no
+# client-side locale dictionary), so this row restates the base table with
+# the product labels. The preset ids, sandbox, and approval knobs match the
+# base row; the composed default stays workspace-write + ask.
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+        name: 仅可查看
+        description: 只读检查：可以查看与检索，不写入文件、不执行有副作用的命令。
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+        name: 工作区内修改
+        description: 可以在工作区内修改文件并执行命令；工作区之外的操作需要逐条审批。
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+        name: 完全权限
+        description: 完整的文件访问与命令执行，不弹出审批；仅在你信任当前任务时使用。
+
+- insert:
+    # Host-owned opt-in the preset delegation tools sample when a session
+    # receives its `subagent` rows; `@deepseek-ai/dsh-tool-subagent` resolves
+    # it from the Host scope. Same host row the web bundle mounts.
+    - id: subagent-model-selection-settings
+      name: "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+
+    # The dynamic-Cordis host half: definition registry, sandboxed host-half
+    # lifecycle, and the `cordisInspect` registry the rows below read. Same
+    # host row the web bundle mounts; without it the cordis preset's
+    # `tool-cordis` row waits forever and the preset lands broken.
+    - id: cordis-host-runner
+      name: "@deepseek-ai/dsh-cordis-host-runner"
+
+    # The Host inspect providers are process-global: the registry rejects a
+    # duplicate id, so they register here once and every preset's
+    # `tool-cordis` row reads them. Same host row the web bundle mounts.
+    - id: cordis-inspect-providers
+      name: "@deepseek-ai/dsh-tool-cordis/host"
+
+    # The preset roster: shipped presets are the four declaration patches
+    # under `presets/` (listed after this file in `dsh.bundle.patch`), each
+    # inserting one `@deepseek-ai/dsh-agent-preset` row that registers into
+    # this registry, and `default: standard` composes every session that
+    # names no preset. The `preset` config option reads this service; a
+    # session may switch while still blank.
+    - id: agent-preset-registry
+      name: "@deepseek-ai/dsh-agent-preset-registry"
+      config:
+        default: standard
+
+- insert:
+    # The profile startup latch (help/--dump-config must not claim stdio).
+    - id: zed-acp-startup
+      name: "@8kugames/dsh-zed-acp/startup"
+
+    # The Zed-oriented ACP bridge: the widened server over the base
+    # composition. Referenced by package name so the installed package
+    # resolves; the package `exports["."]` points at dist/index.js.
+    - id: zed-acp
+      name: "@8kugames/dsh-zed-acp"
+      inject: [zedAcpStartup]
+      config:
+        provider: deepseek-official
+        model: deepseek-v4-flash

@@ -1,0 +1,11 @@
+# Pure build artifact (build.mjs); git-hosted installs rebuild it via the
+# prepare hook in package.json.
+dist/
+node_modules/
+*.tsbuildinfo
+.DS_Store
+logs/
+.claude/
+.remember/
+.build/
+.governance/
