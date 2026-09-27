@@ -61,6 +61,22 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 | 工具调用 | 通用 `other` 类别                   | 标准类别（`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`）与 `write`/`edit` 结果的原生**文件差异** |
 | 预设     | 宿主面工具                          | web 式拆分：模型面行移入每个预设自己的组成（`standard`/`ptc`/`minimal`/`cordis`）                          |
 
+## 回合统计与费用
+
+每个正常收尾的 ACP 提问回合，都会以一张 **Turn stats** 卡片（一条普通 agent 消息）加一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展的最终 `usage_update` 收束。Zed 把卡片当 markdown 渲染，上下文条继续用 `used`/`size`，并显示费用；其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。
+
+卡片按回合报告：输入拆分为缓存读 / 缓存写 / 未缓存，输出（含上报的思考 token），模型用时（每次模型调用的请求到流结束），工具用时（`tool/call` → `tool/result`），首 token 平均延迟（TTFT，取自持久流记录），输出速度（解码窗口内每秒 token 数），以及费用。所有时序都来自已提交事件的时间戳，而非投影时刻采样，因此重放时数值一致。
+
+费用采用 DeepSeek 公布价（每 1M token、USD，2026-09 核对）：`deepseek-flash` 峰时 $0.006 命中 / $0.3 未命中 / $1.2 输出，`deepseek-v4-pro` 峰时 $0.044 / $1.32 / $3.96，谷时按峰时减半计费（峰时 = UTC 周一至周五 01:00–04:00 与 06:00–10:00）。已退役的 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 解析到 `deepseek-flash`。缓存写按未命中价计费，与 DeepSeek 计费一致。中国法定节假日的峰时豁免未建模；未列出的模型不报费用。
+
+用 `DSH_ACP_PRICES` 覆盖或扩充价目，值为扁平每 1M 费率的 JSON 对象（全时段生效，同 id 时遮蔽内置分时价）：
+
+```json
+{ "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
+```
+
+格式非法时忽略并记录警告。累计值只覆盖 agent 进程打开该会话以来的活跃回合——恢复会话或重启 Zed 后重新计数。取消与失败的回合不发出卡片。
+
 ## 兼容性
 
 peer 范围声明为 `~0.1.7-rc.2`：自 `0.1.7-rc.2` 起的 0.1.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。

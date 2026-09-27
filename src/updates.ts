@@ -193,6 +193,17 @@ function fileDiffsFromMeta(meta: unknown): FileDiff[] | undefined {
   return narrowed
 }
 
+/** Report the session's current context occupancy when both facts are available. */
+export function contextUsage(
+  ctx: Context,
+  session: Session,
+): { used: number; size: number } | undefined {
+  const meter = ctx.get('tokenMeter')
+  const size = session.requestContext()?.contextWindow
+  if (meter === undefined || size === undefined) return undefined
+  return { used: meter.measure(session).totalTokens, size }
+}
+
 /** Report current context occupancy only when DSH has both usage and capacity facts. */
 function usageUpdate(
   ctx: Context,
@@ -200,13 +211,12 @@ function usageUpdate(
   event: SessionEvent<'assistant/message'>,
 ): SessionUpdate | undefined {
   if (event.data.usage === undefined) return undefined
-  const size = session.requestContext()?.contextWindow
-  const meter = ctx.get('tokenMeter')
-  if (size === undefined || meter === undefined) return undefined
+  const usage = contextUsage(ctx, session)
+  if (usage === undefined) return undefined
   return {
     sessionUpdate: 'usage_update',
-    used: meter.measure(session).totalTokens,
-    size,
+    used: usage.used,
+    size: usage.size,
   }
 }
 

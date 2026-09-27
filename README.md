@@ -72,6 +72,22 @@ automation-only ACP transport so exactly one server owns stdio.
 | Tool calls     | generic `other` kind                | standard kinds (`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`) and native **file diffs** from `write`/`edit` results |
 | Presets        | host-plane tools                    | the web-style split: model-facing rows move into each preset's composition (`standard`/`ptc`/`minimal`/`cordis`)              |
 
+## Turn statistics and cost
+
+Every ACP-prompt turn that settles normally ends with a **Turn stats** card (a regular agent message) plus a final `usage_update` carrying cumulative session cost and a machine-readable `dsh` `_meta` extension. Zed renders the card as markdown, keeps its context bar on `used`/`size`, and shows the cost; other ACP clients may ignore `_meta` per the protocol's extensibility rules.
+
+The card reports, per turn: input split into cache read / cache write / uncached, output (with reasoning when reported), model time (request to stream end per model call), tool time (`tool/call` → `tool/result`), average first-token latency (TTFT, read from the durable stream records), output speed (tokens per second of the decode window), and cost. All timings come from committed event times, not projection-time sampling, so they are identical on replay.
+
+Cost uses DeepSeek's published list prices (USD per 1M tokens, checked 2026-09): `deepseek-flash` peak $0.006 hit / $0.3 miss / $1.2 out and `deepseek-v4-pro` peak $0.044 / $1.32 / $3.96, with off-peak hours billed at exactly half (peak = 01:00–04:00 and 06:00–10:00 UTC, weekdays). Retired ids `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to `deepseek-flash`. Cache writes bill at the miss rate, matching DeepSeek's billing. The Chinese-public-holiday exclusion is not modeled; unlisted models report no cost.
+
+Override or extend pricing with `DSH_ACP_PRICES`, a JSON object of flat per-1M rates (these apply at every hour and shadow the built-in tiers for the same id):
+
+```json
+{ "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
+```
+
+Malformed values are ignored with a logged warning. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without a card.
+
 ## Compatibility
 
 Peer ranges declare `~0.1.7-rc.2`: any dsh in the 0.1.x line from

@@ -53,6 +53,8 @@ describe('ACP automation output boundary', () => {
       'tool_call_update',
       'agent_message_chunk',
       'usage_update',
+      'agent_message_chunk',
+      'usage_update',
     ])
     expect(harness.updates[0]).toMatchObject({
       sessionUpdate: 'agent_thought_chunk',
@@ -78,12 +80,13 @@ describe('ACP automation output boundary', () => {
       content: { type: 'text', text: 'done' },
     })
     expect('messageId' in harness.updates[4]!).toBe(true)
-    expect(harness.updates[5]).toMatchObject({
+    expect(harness.updates[7]).toMatchObject({
       sessionUpdate: 'usage_update',
       size: 1_024,
     })
-    if (harness.updates[5]?.sessionUpdate !== 'usage_update') throw new Error('expected usage update')
-    expect(typeof harness.updates[5].used).toBe('number')
+    if (harness.updates[7]?.sessionUpdate !== 'usage_update') throw new Error('expected usage update')
+    expect(typeof harness.updates[7].used).toBe('number')
+    if (harness.updates[7]?._meta?.dsh === undefined) throw new Error('expected stats _meta')
   })
 
   it('ignores events from agents the bridge does not own', async () => {

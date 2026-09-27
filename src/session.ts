@@ -9,6 +9,7 @@ import {
   type SessionConfigOption,
   type SessionModeState,
   type SessionNotification,
+  type SessionUpdate,
   type StopReason,
 } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
@@ -24,7 +25,16 @@ import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
 import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import {
+  TurnStatsCollector,
+  foldTurnStats,
+  formatStatsCard,
+  statsMeta,
+  type PriceTable,
+  type SessionStats,
+  type TurnStats,
+} from './stats.ts'
+import { assistantUpdates, contextUsage, toolCallUpdate, toolResultUpdate } from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -40,6 +50,8 @@ interface AcpSessionBuildOptions {
   fallbackSelection: ModelSelection | undefined
   signal: AbortSignal
   notify: (notification: SessionNotification) => Promise<void>
+  /** Effective price table for turn/session cost reporting. */
+  prices: PriceTable
 }
 
 /** Fresh ACP session construction inputs. */
@@ -66,6 +78,7 @@ interface InflightPrompt {
   settlementStarted: boolean
   outputError: Error | undefined
   agentError: Error | undefined
+  stats: TurnStats | undefined
 }
 
 /** Standard invalid-parameter failure with protocol-safe detail. */
@@ -136,6 +149,8 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
+  private statsCollector: TurnStatsCollector | undefined
+  private sessionStats: SessionStats = { usage: { inputTokens: 0, outputTokens: 0, modelCalls: 0 }, cost: undefined }
 
   private constructor(
     private readonly ctx: Context,
@@ -144,6 +159,7 @@ export class AcpSession {
     private readonly notify: (notification: SessionNotification) => Promise<void>,
     private readonly presets: AgentPresetRegistry | undefined,
     permissions: PermissionPresetService | undefined,
+    private readonly prices: PriceTable,
   ) {
     this.agent = handle.agent
     this.modelControl = modelControl
@@ -183,7 +199,7 @@ export class AcpSession {
         await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
       },
     })
-    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'))
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices)
   }
 
   /**
@@ -222,7 +238,7 @@ export class AcpSession {
       throw internalError('session/resume did not compose model selection')
     }
     /* v8 ignore stop */
-    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'))
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices)
   }
 
   /**
@@ -374,6 +390,7 @@ export class AcpSession {
       settlementStarted: false,
       outputError: undefined,
       agentError: undefined,
+      stats: undefined,
     }
     this.inflight = inflight
     const onRequestAbort = (): void => { this.cancelPrompt('ACP prompt request cancelled') }
@@ -453,6 +470,7 @@ export class AcpSession {
    * @param event - committed durable event.
    */
   onSessionEvent(session: Session, event: SessionEvent): void {
+    this.trackStats(event)
     try {
       if (event.type === 'assistant/message') {
         const inflight = this.inflight?.turn === event.data.turn ? this.inflight : undefined
@@ -546,6 +564,80 @@ export class AcpSession {
   }
 
   /**
+   * Feed the live prompt's turn statistics while its events commit. A
+   * `turn/start` under an in-flight prompt opens a fresh collector; its
+   * matching `turn/end` finalizes it into the prompt slot and the
+   * session-lifetime totals.
+   * @param event - committed durable event.
+   */
+  private trackStats(event: SessionEvent): void {
+    const inflight = this.inflight
+    if (inflight === undefined) return
+    if (event.type === 'turn/start') {
+      this.statsCollector = new TurnStatsCollector(
+        event.data.turn,
+        () => this.modelControl.snapshot()?.model,
+        this.prices,
+      )
+      return
+    }
+    const collector = this.statsCollector
+    if (collector === undefined) return
+    if (event.type === 'turn/end') {
+      if (event.data.turn !== collector.turn) return
+      this.statsCollector = undefined
+      const stats = collector.result()
+      if (stats === undefined) return
+      inflight.stats = stats
+      this.sessionStats = foldTurnStats(this.sessionStats, stats)
+      return
+    }
+    collector.record(event)
+  }
+
+  /**
+   * Deliver the finalized turn statistics: one markdown card message, then
+   * the final `usage_update` carrying cumulative cost and the machine-readable
+   * `dsh` `_meta` extension. Both queue onto the ordered output tail; turns
+   * that were cancelled or failed settle without a card.
+   * @param inflight - the settling prompt slot.
+   */
+  private async emitTurnStats(inflight: InflightPrompt): Promise<void> {
+    const stats = inflight.stats
+    if (stats === undefined || inflight.cancelRequested) return
+    if (inflight.outputError !== undefined || inflight.agentError !== undefined) return
+    const end = inflight.endReason
+    if (end === undefined || end.kind === 'error') return
+    const updates: SessionUpdate[] = [{
+      sessionUpdate: 'agent_message_chunk',
+      messageId: `dsh-stats-${stats.turn}`,
+      content: { type: 'text', text: formatStatsCard(stats, this.sessionStats, this.modelControl.snapshot()?.model) },
+    }]
+    const usage = contextUsage(this.ctx, this.agent.session)
+    if (usage !== undefined) {
+      updates.push({
+        sessionUpdate: 'usage_update',
+        used: usage.used,
+        size: usage.size,
+        ...(this.sessionStats.cost === undefined ? {} : {
+          cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
+        }),
+        _meta: statsMeta(stats, this.sessionStats),
+      })
+    }
+    const previous = this.outputTail
+    const delivery = previous.then(async () => {
+      for (const update of updates) {
+        await this.notify({ sessionId: this.agent.session.id, update })
+      }
+    })
+    this.outputTail = delivery.catch((error: unknown) => {
+      this.ctx.logger.warn(`acp: turn-stats delivery failed: ${errorChain(error)}`)
+    })
+    await this.outputTail
+  }
+
+  /**
    * Cancel, drain, flush, and dispose this session once.
    * @param detail - cancellation detail for any prompt still in admission.
    * @returns the shared quiescent teardown promise.
@@ -616,6 +708,7 @@ export class AcpSession {
       }
       /* v8 ignore next -- this prompt owns the slot until this exact settlement clears it. */
       if (this.inflight !== inflight) return
+      await this.emitTurnStats(inflight)
       this.inflight = undefined
       if (inflight.cancelRequested) {
         inflight.resolve('cancelled')

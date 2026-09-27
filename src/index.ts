@@ -70,6 +70,7 @@ import { AcpPermissionConfigError } from './permission-control.ts'
 import { AcpPresetConfigError } from './preset-control.ts'
 import { bridgeAcpQuestions } from './questions.ts'
 import { AcpSession } from './session.ts'
+import { buildPriceTable } from './stats.ts'
 import { ACP_AGENT_VERSION } from './version.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
@@ -128,6 +129,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const apiKeyRef = resolveApiKeyRef(config.apiKeyEnv)
   const sessions = new Map<SessionId, AcpSession>()
   const activating = new Set<SessionId>()
+  const prices = buildPriceTable(process.env.DSH_ACP_PRICES, (message) => { logger.warn(message) })
   let closed = false
   let imagePromptEnabled = false
 
@@ -248,6 +250,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           fallbackSelection: initialSelection(config),
           signal,
           notify,
+          prices,
         })
       } catch (error: unknown) {
         if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
@@ -300,6 +303,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             fallbackSelection: initialSelection(config),
             signal,
             notify,
+            prices,
           })
         } catch (error: unknown) {
           if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
