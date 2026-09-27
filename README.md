@@ -62,21 +62,24 @@ automation-only ACP transport so exactly one server owns stdio.
 
 ## What it adds over the shipped `dsh --profile acp`
 
-|                | shipped `acp` profile               | this plugin                                                                                                                   |
-| -------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Sessions       | `new` / `list` / `resume` / `close` | same, plus per-session **titles** in `session/list`                                                                           |
-| Auth           | accepted, unchecked                 | `deepseek-api-key` method; `authenticate` validates the credential and explains what is missing                               |
-| Modes          | —                                   | `default` / `plan` via `session/set_mode` with `current_mode_update`                                                          |
-| Config options | `model`, `reasoning_effort`         | plus **`preset`** (agent presets) and **`permission`** (sandbox/approval presets, localized labels)                           |
-| Questions      | —                                   | single-choice `ask_user_question` (plan review) rides `session/request_permission`                                            |
-| Tool calls     | generic `other` kind                | standard kinds (`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`) and native **file diffs** from `write`/`edit` results |
-| Presets        | host-plane tools                    | the web-style split: model-facing rows move into each preset's composition (`standard`/`ptc`/`minimal`/`cordis`)              |
+|                | shipped `acp` profile               | this plugin                                                                                                                                                      |
+| -------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sessions       | `new` / `list` / `resume` / `close` | same, plus per-session **titles** in `session/list` and live `session_info_update` from the harness's own title events                                           |
+| Auth           | accepted, unchecked                 | `deepseek-api-key` method; `authenticate` validates the credential and explains what is missing                                                                  |
+| Modes          | —                                   | `default` / `plan` via `session/set_mode` with `current_mode_update`                                                                                             |
+| Config options | `model`, `reasoning_effort`         | plus **`preset`** (agent presets) and **`permission`** (sandbox/approval presets, localized labels)                                                              |
+| Questions      | —                                   | single-choice `ask_user_question` (plan review) rides `session/request_permission`                                                                               |
+| Plan           | —                                   | the agent's `todo` snapshots project as ACP `plan` updates, so the client renders its native plan panel                                                          |
+| Slash commands | —                                   | `available_commands_update` lists the host command registry's effective roster per session                                                                       |
+| Tool calls     | generic `other` kind                | standard kinds (`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`), follow-along **`locations`**, and native **file diffs** from `write`/`edit` results     |
+| Terminals      | —                                   | command tool calls embed a **display terminal** (Zed's `terminal_output` extension) when the client advertises it; everyone else keeps the plain text projection |
+| Presets        | host-plane tools                    | the web-style split: model-facing rows move into each preset's composition (`standard`/`ptc`/`minimal`/`cordis`)                                                 |
 
 ## Turn statistics and cost
 
-Every ACP-prompt turn that settles normally ends with a **Turn stats** card (a regular agent message) plus a final `usage_update` carrying cumulative session cost and a machine-readable `dsh` `_meta` extension. Zed renders the card as markdown, keeps its context bar on `used`/`size`, and shows the cost; other ACP clients may ignore `_meta` per the protocol's extensibility rules.
+Every ACP-prompt turn that settles normally ends with a final `usage_update` carrying cumulative session cost and a machine-readable `dsh` `_meta` extension (per-turn and session-lifetime token and timing facts). Zed keeps its context bar on `used`/`size` and shows the cost; other ACP clients may ignore `_meta` per the protocol's extensibility rules.
 
-The card reports, per turn: input split into cache read / cache write / uncached, output (with reasoning when reported), model time (request to stream end per model call), tool time (`tool/call` → `tool/result`), average first-token latency (TTFT, read from the durable stream records), output speed (tokens per second of the decode window), and cost. All timings come from committed event times, not projection-time sampling, so they are identical on replay.
+Definitions follow dsh's own statistics (`dsh-token-meter` buckets and the harness UI's session stats). dsh maps `TokenUsage.inputTokens` onto its own `uncachedInputTokens`, so the uncached-input figure is never netted against cache reads, and the three prompt buckets are disjoint. Model time is `step/start → assistant/message` per model call; tool time is `tool/call → tool/result`; TTFT is `step/start → first token delta`; and output speed is `first token delta → assistant/message` computed over the steps that recorded **both** that window and their output tokens, so a step without stream timing contributes no rate instead of skewing one. All timings come from committed event times, not projection-time sampling, so they are identical on replay.
 
 Cost uses DeepSeek's published list prices (USD per 1M tokens, checked 2026-09): `deepseek-flash` peak $0.006 hit / $0.3 miss / $1.2 out and `deepseek-v4-pro` peak $0.044 / $1.32 / $3.96, with off-peak hours billed at exactly half (peak = 01:00–04:00 and 06:00–10:00 UTC, weekdays). Retired ids `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to `deepseek-flash`. Cache writes bill at the miss rate, matching DeepSeek's billing. The Chinese-public-holiday exclusion is not modeled; unlisted models report no cost.
 
@@ -86,7 +89,7 @@ Override or extend pricing with `DSH_ACP_PRICES`, a JSON object of flat per-1M r
 { "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
 ```
 
-Malformed values are ignored with a logged warning. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without a card.
+Malformed values are ignored with a logged warning. Cache writes bill at the miss rate, matching DeepSeek's billing. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without the final update.
 
 ## Compatibility
 
@@ -94,6 +97,12 @@ Peer ranges declare `~0.1.7-rc.2`: any dsh in the 0.1.x line from
 `0.1.7-rc.2` on is accepted; dsh's profile boot checks them at install and
 boot and names an incompatible plugin loudly. All `@deepseek-ai/*` modules
 load from the host installation — the plugin ships no runtime.
+
+Client-facing extensions degrade gracefully: the display terminal, plan,
+session-title, and slash-command projections use only standard ACP updates
+except the terminal itself, which activates solely when the client advertises
+Zed's `terminal_output` capability at `initialize` — non-advertising clients
+never see a terminal-shaped update and keep the plain tool-result content.
 
 ## Custom, non-DeepSeek models
 

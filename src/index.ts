@@ -58,6 +58,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type imports: declaration-merge the approval waterfall answered
 // below, the user-questions waterfall the questions bridge answers, and the
 // optional projection cache the session-list title read resolves through.
+import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -132,6 +133,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const prices = buildPriceTable(process.env.DSH_ACP_PRICES, (message) => { logger.warn(message) })
   let closed = false
   let imagePromptEnabled = false
+  // Zed's display-terminal extension: the client advertises it in the
+  // capability _meta (the codex-acp contract); non-advertising clients keep
+  // the plain tool-result content projection.
+  let clientTerminalOutput = false
 
   /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
   const ownedRecord = (agent: Parameters<AcpSession['owns']>[0]): AcpSession | undefined => {
@@ -177,6 +182,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
     for (const record of sessions.values()) record.topologyChanged()
   })
 
+  // Slash-command rosters can change while sessions are live; every owned
+  // session republishes its effective view of the registry.
+  ctx.on('commands/change', () => {
+    for (const record of sessions.values()) record.publishAvailableCommands()
+  })
+
   // Permission requests are a machine policy channel for ACP clients such as
   // dsh-subagent-acp. The bridge offers one-shot choices only and never infers a
   // durable grant from an unknown client response.
@@ -216,10 +227,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
   })
 
   const implementation = {
-    async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    async initialize(params: InitializeRequest): Promise<InitializeResponse> {
       // Single-version agent: the spec's "same version if supported, else
       // the latest supported" both resolve to this server's one version.
       imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
+      clientTerminalOutput = params.clientCapabilities?._meta?.terminal_output === true
       return {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'dsh-zed-acp', version: ACP_AGENT_VERSION },
@@ -251,6 +263,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           signal,
           notify,
           prices,
+          terminal: { enabled: clientTerminalOutput, cwd: params.cwd },
         })
       } catch (error: unknown) {
         if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
@@ -269,6 +282,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
+        // Deferred to a macrotask so the session/new response is queued onto
+        // the stdio stream first; a strict client that drops updates for
+        // sessions it has not yet seen registered still receives the roster.
+        setImmediate(() => {
+          if (sessions.get(sessionId) === record) record.publishAvailableCommands()
+        })
         return { sessionId, ...(modes === undefined ? {} : { modes }), configOptions }
       } catch (error: unknown) {
         sessions.delete(sessionId)
@@ -304,6 +323,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             signal,
             notify,
             prices,
+            terminal: { enabled: clientTerminalOutput, cwd: params.cwd },
           })
         } catch (error: unknown) {
           if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
@@ -324,6 +344,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         try {
           const configOptions = await record.configOptions(signal)
           const modes = record.modesState()
+          // Same response-first deferral as session/new: the roster follows the
+          // session/resume response onto the wire.
+          setImmediate(() => {
+            if (sessions.get(sessionId) === record) record.publishAvailableCommands()
+          })
           return { ...(modes === undefined ? {} : { modes }), configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)

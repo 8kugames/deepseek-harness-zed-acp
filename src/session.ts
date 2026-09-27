@@ -27,14 +27,27 @@ import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
 import {
   TurnStatsCollector,
+  emptySessionStats,
   foldTurnStats,
-  formatStatsCard,
   statsMeta,
   type PriceTable,
   type SessionStats,
   type TurnStats,
 } from './stats.ts'
-import { assistantUpdates, contextUsage, toolCallUpdate, toolResultUpdate } from './updates.ts'
+import {
+  DEFAULT_MODE_ID,
+  PLAN_MODE_ID,
+  availableCommandsUpdate,
+  assistantUpdates,
+  contextUsage,
+  currentModeUpdate,
+  sessionTitleUpdate,
+  todoPlanUpdate,
+  toolCallUpdate,
+  toolResultUpdate,
+  type ProjectedToolCall,
+  type TerminalPresentation,
+} from './updates.ts'
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -52,6 +65,8 @@ interface AcpSessionBuildOptions {
   notify: (notification: SessionNotification) => Promise<void>
   /** Effective price table for turn/session cost reporting. */
   prices: PriceTable
+  /** Client display-terminal presentation negotiated at initialize. */
+  terminal: TerminalPresentation
 }
 
 /** Fresh ACP session construction inputs. */
@@ -85,12 +100,6 @@ interface InflightPrompt {
 function invalidParams(detail: string): RequestError {
   return RequestError.invalidParams(undefined, detail)
 }
-
-/** The advertised default mode id. */
-export const DEFAULT_MODE_ID = 'default'
-
-/** The advertised plan-mode id, backed by the plan-mode service. */
-export const PLAN_MODE_ID = 'plan'
 
 const DEFAULT_MODE = {
   id: DEFAULT_MODE_ID,
@@ -150,7 +159,9 @@ export class AcpSession {
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
   private statsCollector: TurnStatsCollector | undefined
-  private sessionStats: SessionStats = { usage: { inputTokens: 0, outputTokens: 0, modelCalls: 0 }, cost: undefined }
+  private sessionStats: SessionStats = emptySessionStats()
+  /** Per-call presentation state (locations, display-terminal) carried from `tool/call` to `tool/result`. */
+  private readonly projectedCalls = new Map<string, ProjectedToolCall>()
 
   private constructor(
     private readonly ctx: Context,
@@ -160,6 +171,7 @@ export class AcpSession {
     private readonly presets: AgentPresetRegistry | undefined,
     permissions: PermissionPresetService | undefined,
     private readonly prices: PriceTable,
+    private readonly terminal: TerminalPresentation,
   ) {
     this.agent = handle.agent
     this.modelControl = modelControl
@@ -199,7 +211,7 @@ export class AcpSession {
         await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
       },
     })
-    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices)
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices, options.terminal)
   }
 
   /**
@@ -238,7 +250,7 @@ export class AcpSession {
       throw internalError('session/resume did not compose model selection')
     }
     /* v8 ignore stop */
-    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices)
+    return new AcpSession(ctx, handle, modelControl, options.notify, presets, ctx.get('permissionPresets'), options.prices, options.terminal)
   }
 
   /**
@@ -355,6 +367,26 @@ export class AcpSession {
       /* v8 ignore start -- option discovery contains per-provider failure. */
       .catch((error: unknown) => {
         this.ctx.logger.warn(`acp: config-option update failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
+  /**
+   * Publish the host registry's effective slash-command roster for this
+   * session as an `available_commands_update`, serialized onto the ordered
+   * output tail without blocking execution updates. A deployment without the
+   * command registry publishes nothing.
+   */
+  publishAvailableCommands(): void {
+    if (this.closing !== undefined) return
+    const update = availableCommandsUpdate(this.ctx.get('commands'), this.agent)
+    if (update === undefined) return
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({ sessionId: this.agent.session.id, update }))
+      /* v8 ignore start -- the bridge notifier contains transport failure. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: available-commands update failed: ${errorChain(error)}`)
       })
     /* v8 ignore stop */
   }
@@ -486,9 +518,16 @@ export class AcpSession {
           this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
         })
       } else if (event.type === 'tool/call') {
+        const update = toolCallUpdate(event, this.terminal)
+        this.projectedCalls.set(event.data.callId, {
+          // Derived from the update the client actually received, so the
+          // completion path can never drift from the embedded presentation.
+          terminal: update.content?.some(content => content.type === 'terminal') === true,
+          locations: update.locations,
+        })
         const previous = this.outputTail
         this.outputTail = previous
-          .then(() => this.notify({ sessionId: this.agent.session.id, update: toolCallUpdate(event) }))
+          .then(() => this.notify({ sessionId: this.agent.session.id, update }))
           /* v8 ignore start -- the bridge notifier contains transport rejection. */
           .catch((error: unknown) => {
             this.ctx.logger.warn(`acp: tool-call update delivery failed: ${errorChain(error)}`)
@@ -499,23 +538,41 @@ export class AcpSession {
         this.outputTail = previous
           .then(() => this.notify({
             sessionId: this.agent.session.id,
-            update: {
-              sessionUpdate: 'current_mode_update',
-              currentModeId: event.data.active ? PLAN_MODE_ID : DEFAULT_MODE_ID,
-            },
+            update: currentModeUpdate(event),
           }))
           /* v8 ignore start -- the bridge notifier contains transport rejection. */
           .catch((error: unknown) => {
             this.ctx.logger.warn(`acp: mode update delivery failed: ${errorChain(error)}`)
           })
         /* v8 ignore stop */
-      } else if (event.type === 'tool/result') {
+      } else if (event.type === 'todo/write') {
         const previous = this.outputTail
         this.outputTail = previous
-          .then(async () => this.notify({
-            sessionId: this.agent.session.id,
-            update: await toolResultUpdate(this.ctx, event),
-          }))
+          .then(() => this.notify({ sessionId: this.agent.session.id, update: todoPlanUpdate(event) }))
+          /* v8 ignore start -- the bridge notifier contains transport rejection. */
+          .catch((error: unknown) => {
+            this.ctx.logger.warn(`acp: plan update delivery failed: ${errorChain(error)}`)
+          })
+        /* v8 ignore stop */
+      } else if (event.type === 'session/title') {
+        const previous = this.outputTail
+        this.outputTail = previous
+          .then(() => this.notify({ sessionId: this.agent.session.id, update: sessionTitleUpdate(event) }))
+          /* v8 ignore start -- the bridge notifier contains transport rejection. */
+          .catch((error: unknown) => {
+            this.ctx.logger.warn(`acp: session-title update delivery failed: ${errorChain(error)}`)
+          })
+        /* v8 ignore stop */
+      } else if (event.type === 'tool/result') {
+        const call = this.projectedCalls.get(event.data.message.toolCallId)
+        this.projectedCalls.delete(event.data.message.toolCallId)
+        const previous = this.outputTail
+        this.outputTail = previous
+          .then(async () => {
+            for (const update of await toolResultUpdate(this.ctx, event, call)) {
+              await this.notify({ sessionId: this.agent.session.id, update })
+            }
+          })
           /* v8 ignore start -- supplemental-content conversion failure is contained and cannot fail Agent work. */
           .catch((error: unknown) => {
             this.ctx.logger.warn(`acp: tool-result update delivery failed: ${errorChain(error)}`)
@@ -596,10 +653,10 @@ export class AcpSession {
   }
 
   /**
-   * Deliver the finalized turn statistics: one markdown card message, then
-   * the final `usage_update` carrying cumulative cost and the machine-readable
-   * `dsh` `_meta` extension. Both queue onto the ordered output tail; turns
-   * that were cancelled or failed settle without a card.
+   * Deliver the finalized turn statistics: one final `usage_update` carrying
+   * cumulative cost and the machine-readable `dsh` `_meta` extension. The
+   * update queues onto the ordered output tail; turns that were cancelled or
+   * failed settle without one.
    * @param inflight - the settling prompt slot.
    */
   private async emitTurnStats(inflight: InflightPrompt): Promise<void> {
@@ -608,28 +665,20 @@ export class AcpSession {
     if (inflight.outputError !== undefined || inflight.agentError !== undefined) return
     const end = inflight.endReason
     if (end === undefined || end.kind === 'error') return
-    const updates: SessionUpdate[] = [{
-      sessionUpdate: 'agent_message_chunk',
-      messageId: `dsh-stats-${stats.turn}`,
-      content: { type: 'text', text: formatStatsCard(stats, this.sessionStats, this.modelControl.snapshot()?.model) },
-    }]
     const usage = contextUsage(this.ctx, this.agent.session)
-    if (usage !== undefined) {
-      updates.push({
-        sessionUpdate: 'usage_update',
-        used: usage.used,
-        size: usage.size,
-        ...(this.sessionStats.cost === undefined ? {} : {
-          cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
-        }),
-        _meta: statsMeta(stats, this.sessionStats),
-      })
+    if (usage === undefined) return
+    const update: SessionUpdate = {
+      sessionUpdate: 'usage_update',
+      used: usage.used,
+      size: usage.size,
+      ...(this.sessionStats.cost === undefined ? {} : {
+        cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
+      }),
+      _meta: statsMeta(stats, this.sessionStats),
     }
     const previous = this.outputTail
     const delivery = previous.then(async () => {
-      for (const update of updates) {
-        await this.notify({ sessionId: this.agent.session.id, update })
-      }
+      await this.notify({ sessionId: this.agent.session.id, update })
     })
     this.outputTail = delivery.catch((error: unknown) => {
       this.ctx.logger.warn(`acp: turn-stats delivery failed: ${errorChain(error)}`)
@@ -674,6 +723,7 @@ export class AcpSession {
         failures.push(error)
       }
       this.pendingSelections.clear()
+      this.projectedCalls.clear()
       if (failures.length === 1) throw failures[0]
       /* v8 ignore start -- independent teardown failures can aggregate only under multiple simultaneous provider faults. */
       if (failures.length > 1) {

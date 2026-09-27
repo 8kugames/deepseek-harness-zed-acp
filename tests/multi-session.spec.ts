@@ -9,7 +9,6 @@ function messageTextFor(
 ): string {
   return updates.flatMap(({ sessionId: owner, update }) => (
     owner === sessionId && update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text'
-      && !update.messageId?.startsWith('dsh-stats-')
       ? [update.content.text]
       : []
   )).join('')

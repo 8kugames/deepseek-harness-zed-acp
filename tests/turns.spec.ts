@@ -25,7 +25,6 @@ async function newSession(harness: BridgeHarness): Promise<string> {
 function messageText(harness: BridgeHarness): string {
   return harness.updates.flatMap(update => (
     update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text'
-      && !update.messageId?.startsWith('dsh-stats-')
       ? [update.content.text]
       : []
   )).join('')

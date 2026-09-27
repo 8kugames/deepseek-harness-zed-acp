@@ -22,7 +22,8 @@
     "registry",
     "README.md",
     "LICENSE",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
@@ -59,6 +60,7 @@
     "@deepseek-ai/dsh-agent-tool-presentation": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-attachment": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-cmdline": "~0.1.7-rc.2",
+    "@deepseek-ai/dsh-commands": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-credentials": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-cordis-host-runner": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-launch-environment": "~0.1.7-rc.2",
@@ -80,6 +82,7 @@
     "@deepseek-ai/dsh-tool-bash-persistent": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-tool-cordis": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-tool-pwsh-persistent": "~0.1.7-rc.2",
+    "@deepseek-ai/dsh-tool-todo": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-typert-protocol": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-user-approval": "~0.1.7-rc.2",
     "@deepseek-ai/dsh-user-questions": "~0.1.7-rc.2"
@@ -104,6 +107,9 @@
       "optional": true
     },
     "@deepseek-ai/dsh-cmdline": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-commands": {
       "optional": true
     },
     "@deepseek-ai/dsh-credentials": {
@@ -169,6 +175,9 @@
     "@deepseek-ai/dsh-tool-pwsh-persistent": {
       "optional": true
     },
+    "@deepseek-ai/dsh-tool-todo": {
+      "optional": true
+    },
     "@deepseek-ai/dsh-typert-protocol": {
       "optional": true
     },
@@ -209,7 +218,9 @@
     "typescript": "^6.0.3",
     "vitest": "^4.1.8",
     "@deepseek-ai/dsh-cmdline": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-commands": "0.1.7-rc.2",
     "@deepseek-ai/dsh-session-title": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-tool-todo": "0.1.7-rc.2",
     "zod": "^4.4.3",
     "@modelcontextprotocol/server": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0"

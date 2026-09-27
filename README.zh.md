@@ -51,21 +51,24 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 
 ## 相比随附的 `dsh --profile acp` 多了什么
 
-|          | 随附 `acp` profile                  | 本插件                                                                                                     |
-| -------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| 会话     | `new` / `list` / `resume` / `close` | 相同，且 `session/list` 带每会话**标题**                                                                   |
-| 认证     | 接受但不校验                        | `deepseek-api-key` 方法；`authenticate` 校验凭据并解释缺什么                                               |
-| 模式     | ——                                  | 经 `session/set_mode` 的 `default` / `plan`，附 `current_mode_update`                                      |
-| 配置项   | `model`、`reasoning_effort`         | 另有 **`preset`**（agent 预设）与 **`permission`**（沙箱/审批预设，本地化文案）                            |
-| 问题     | ——                                  | 单选 `ask_user_question`（计划评审）经 `session/request_permission` 往返                                   |
-| 工具调用 | 通用 `other` 类别                   | 标准类别（`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`）与 `write`/`edit` 结果的原生**文件差异** |
-| 预设     | 宿主面工具                          | web 式拆分：模型面行移入每个预设自己的组成（`standard`/`ptc`/`minimal`/`cordis`）                          |
+|          | 随附 `acp` profile                  | 本插件                                                                                                                               |
+| -------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 会话     | `new` / `list` / `resume` / `close` | 相同，且 `session/list` 带每会话**标题**，标题事件实时投射为 `session_info_update`                                                   |
+| 认证     | 接受但不校验                        | `deepseek-api-key` 方法；`authenticate` 校验凭据并解释缺什么                                                                         |
+| 模式     | ——                                  | 经 `session/set_mode` 的 `default` / `plan`，附 `current_mode_update`                                                                |
+| 配置项   | `model`、`reasoning_effort`         | 另有 **`preset`**（agent 预设）与 **`permission`**（沙箱/审批预设，本地化文案）                                                      |
+| 问题     | ——                                  | 单选 `ask_user_question`（计划评审）经 `session/request_permission` 往返                                                             |
+| 计划     | ——                                  | agent 的 `todo` 快照投射为 ACP `plan` 更新，客户端用原生计划面板渲染                                                                 |
+| 斜杠命令 | ——                                  | `available_commands_update` 按会话列出宿主命令注册表的有效目录                                                                       |
+| 工具调用 | 通用 `other` 类别                   | 标准类别（`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`）、跟随式 **`locations`**，与 `write`/`edit` 结果的原生**文件差异** |
+| 终端     | ——                                  | 命令类工具调用在客户端声明 Zed `terminal_output` 扩展时嵌入**展示终端**，其余客户端保持纯文本投影                                    |
+| 预设     | 宿主面工具                          | web 式拆分：模型面行移入每个预设自己的组成（`standard`/`ptc`/`minimal`/`cordis`）                                                    |
 
 ## 回合统计与费用
 
-每个正常收尾的 ACP 提问回合，都会以一张 **Turn stats** 卡片（一条普通 agent 消息）加一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展的最终 `usage_update` 收束。Zed 把卡片当 markdown 渲染，上下文条继续用 `used`/`size`，并显示费用；其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。
+每个正常收尾的 ACP 提问回合，都会以一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展（回合与会话两级的 token 与时序事实）的最终 `usage_update` 收束。Zed 的上下文条继续用 `used`/`size` 并显示费用；其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。
 
-卡片按回合报告：输入拆分为缓存读 / 缓存写 / 未缓存，输出（含上报的思考 token），模型用时（每次模型调用的请求到流结束），工具用时（`tool/call` → `tool/result`），首 token 平均延迟（TTFT，取自持久流记录），输出速度（解码窗口内每秒 token 数），以及费用。所有时序都来自已提交事件的时间戳，而非投影时刻采样，因此重放时数值一致。
+口径完全沿用 dsh 自身统计（`dsh-token-meter` 分桶与 harness UI 的会话统计）：dsh 把 `TokenUsage.inputTokens` 映射为自己的 `uncachedInputTokens`，因此未缓存输入不会被再去减缓存读取，三个输入桶互斥；模型用时为每次模型调用的 `step/start → assistant/message`，工具用时为 `tool/call → tool/result`，TTFT 为 `step/start → 首个 token delta`，输出速度为 `首个 token delta → assistant/message`，且只在**同时**记录了该窗口与该步输出 token 的步骤上计算，因此没有流式时刻的步骤不贡献速度值、也不拉偏结果。所有时序都来自已提交事件的时间戳，而非投影时刻采样，因此重放时数值一致。
 
 费用采用 DeepSeek 公布价（每 1M token、USD，2026-09 核对）：`deepseek-flash` 峰时 $0.006 命中 / $0.3 未命中 / $1.2 输出，`deepseek-v4-pro` 峰时 $0.044 / $1.32 / $3.96，谷时按峰时减半计费（峰时 = UTC 周一至周五 01:00–04:00 与 06:00–10:00）。已退役的 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 解析到 `deepseek-flash`。缓存写按未命中价计费，与 DeepSeek 计费一致。中国法定节假日的峰时豁免未建模；未列出的模型不报费用。
 
@@ -75,11 +78,13 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 { "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
 ```
 
-格式非法时忽略并记录警告。累计值只覆盖 agent 进程打开该会话以来的活跃回合——恢复会话或重启 Zed 后重新计数。取消与失败的回合不发出卡片。
+格式非法时忽略并记录警告。累计值只覆盖 agent 进程打开该会话以来的活跃回合——恢复会话或重启 Zed 后重新计数。取消与失败的回合不发出该更新。
 
 ## 兼容性
 
 peer 范围声明为 `~0.1.7-rc.2`：自 `0.1.7-rc.2` 起的 0.1.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。
+
+面向客户端的扩展都有优雅降级：展示终端、计划、会话标题与斜杠命令投射只用标准 ACP 更新；终端本身仅在客户端于 `initialize` 声明 Zed 的 `terminal_output` 能力时激活，未声明的客户端不会看到任何终端形状的更新，继续收到纯文本工具结果。
 
 ## 自配非 DeepSeek 模型
 

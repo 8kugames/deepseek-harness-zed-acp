@@ -9,7 +9,7 @@ import {
   DEEPSEEK_PRICE_TABLE,
   TurnStatsCollector,
   buildPriceTable,
-  formatStatsCard,
+  emptySessionStats,
   foldTurnStats,
   isPeakUtcTime,
   mergePriceOverrides,
@@ -100,31 +100,47 @@ describe('turn statistics collection', () => {
     expect(stats).toBeDefined()
     if (stats === undefined) return
     expect(stats.turn).toBe(7)
-    // Step 0: stream ends at time0+100 = atMs+1000; step started at atMs+100 → 900ms.
-    // Step 1: single-chunk stream ends at its time0 = atMs+3400; step started at atMs+2700 → 700ms.
-    expect(stats.modelMs).toBe(1_600)
-    expect(stats.toolMs).toBe(500)
-    // Decode windows: 100ms (two chunks) and 0ms (single chunk, excluded).
-    expect(stats.outputMs).toBe(100)
-    expect(stats.ttftSamplesMs).toEqual([800, 700])
+    // Upstream wall time: step/start -> assistant/message per model call,
+    // 1900ms and 1300ms; tool time is the call/result gap.
+    expect(stats.timing).toEqual({
+      llmMs: 3_200,
+      toolMs: 500,
+      decodeMs: 1_700,
+      decodeTokens: 80,
+      ttftSumMs: 1_500,
+      ttftCalls: 2,
+    })
     expect(stats.usage).toEqual({
-      inputTokens: 2_200,
+      uncachedInputTokens: 2_200,
       outputTokens: 80,
       cacheReadTokens: 800,
       cacheWriteTokens: 100,
-      reasoningTokens: 20,
       modelCalls: 2,
     })
   })
 
   it('prices listed models per model call and reports no cost for unlisted ones', () => {
     const priced = collectTwoStepTurn()
-    // flash peak: 800 hit·0.006 + 200 miss·0.3 + 50 out·1.2 = 124.8 → $0.0001248;
-    // second call uncached: 1200·0.3 + 30·1.2 = 396 → $0.000396.
-    expect(priced?.cost).toEqual({ amount: 0.000521, currency: 'USD' })
+    // flash peak: call 1 = 800·0.006 hit + (1000+100)·0.3 miss + 50·1.2 out;
+    // call 2 = 1200·0.3 + 30·1.2.
+    expect(priced?.cost).toEqual({ amount: 0.000791, currency: 'USD' })
 
     const unpriced = collectTwoStepTurn(DEEPSEEK_PRICE_TABLE, 'mock')
     expect(unpriced?.cost).toBeUndefined()
+  })
+
+  it('keeps a step without stream timing out of the speed reading', () => {
+    const collector = new TurnStatsCollector(9, () => 'mock', DEEPSEEK_PRICE_TABLE)
+    collector.record(stepStart(9, 0, 1_000))
+    collector.record(assistantMessage(9, 0, 6_000, [], { inputTokens: 100, outputTokens: 400 }))
+    collector.record(event('turn/end', 9, 6_100))
+    const stats = collector.result()
+    expect(stats?.timing.llmMs).toBe(5_000)
+    expect(stats?.timing.decodeMs).toBe(0)
+    expect(stats?.timing.decodeTokens).toBe(0)
+    expect(stats?.timing.ttftCalls).toBe(0)
+    // The output row still bills every call; only the rate excludes unpaired ones.
+    expect(stats?.usage.outputTokens).toBe(400)
   })
 
   it('ignores events from other turns', () => {
@@ -168,14 +184,13 @@ describe('DeepSeek list pricing', () => {
     expect(resolvePrice(DEEPSEEK_PRICE_TABLE, 'some-gateway-model', PEAK_MS)).toBeUndefined()
   })
 
-  it('prices cache reads at the hit rate and the remainder at the miss rate', () => {
+  it('prices cache reads at the hit rate and uncached plus writes at the miss rate', () => {
     const rates = { hit: 0.006, miss: 0.3, out: 1.2 }
+    // `inputTokens` is already uncached input: it is never netted against cache.
     expect(priceUsage(rates, { inputTokens: 1_000, outputTokens: 50, cacheReadTokens: 800 }))
-      .toBeCloseTo(0.0001248, 10)
-    // Reads beyond the reported input still bill at the hit rate; the miss
-    // side never goes negative.
-    expect(priceUsage(rates, { inputTokens: 300, outputTokens: 0, cacheReadTokens: 1_000 }))
-      .toBeCloseTo(0.000006, 10)
+      .toBeCloseTo(0.0003648, 10)
+    expect(priceUsage(rates, { inputTokens: 300, outputTokens: 0, cacheWriteTokens: 200 }))
+      .toBeCloseTo(0.00015, 10)
   })
 })
 
@@ -207,55 +222,50 @@ describe('DSH_ACP_PRICES overrides', () => {
 })
 
 describe('stats presentation', () => {
+  /** A session carrying more turns than the fixture's single one. */
   const session: SessionStats = {
-    usage: { inputTokens: 2_200, outputTokens: 80, cacheReadTokens: 800, cacheWriteTokens: 100, reasoningTokens: 20, modelCalls: 2 },
-    cost: { amount: 0.000521, currency: 'USD' },
+    usage: {
+      uncachedInputTokens: 2_700,
+      outputTokens: 260,
+      cacheReadTokens: 1_500,
+      cacheWriteTokens: 200,
+      modelCalls: 5,
+    },
+    timing: { llmMs: 9_400, toolMs: 2_000, decodeMs: 4_400, decodeTokens: 260, ttftSumMs: 3_600, ttftCalls: 5 },
+    cost: { amount: 0.001582, currency: 'USD' },
   }
-
-  it('renders the card with token rows, timing, and cost', () => {
-    const stats = collectTwoStepTurn()
-    if (stats === undefined) throw new Error('expected stats')
-    const card = formatStatsCard(stats, session, 'deepseek-flash')
-    expect(card).toContain('**Turn stats · deepseek-flash**')
-    expect(card).toContain('model 1.6s')
-    expect(card).toContain('tools 500ms')
-    expect(card).toContain('| Input · cache read | 800 |')
-    expect(card).toContain('| Input · uncached | 1,300 |')
-    expect(card).toContain('| Output · reasoning | 20 |')
-    expect(card).toContain('avg first token 750ms')
-    expect(card).toContain('output 800.0 tok/s')
-    expect(card).toContain('turn $0.0005')
-    expect(card).toContain('session $0.0005')
-  })
-
-  it('omits timing and cost segments without facts', () => {
-    const bare: TurnStats = {
-      turn: 1,
-      usage: { inputTokens: 10, outputTokens: 5, modelCalls: 1 },
-      modelMs: 0,
-      toolMs: 0,
-      outputMs: 0,
-      ttftSamplesMs: [],
-      cost: undefined,
-    }
-    const card = formatStatsCard(bare, { usage: bare.usage, cost: undefined }, undefined)
-    expect(card).toContain('**Turn stats**')
-    expect(card).toContain('| Input · uncached | 10 |')
-    expect(card).not.toContain('cache read')
-    expect(card).not.toContain('avg first token')
-    expect(card).not.toContain('tok/s')
-    expect(card).not.toContain('$')
-  })
 
   it('folds turns into session totals and emits machine-readable meta', () => {
     const stats = collectTwoStepTurn()
     if (stats === undefined) throw new Error('expected stats')
-    const folded = foldTurnStats({ usage: { inputTokens: 0, outputTokens: 0, modelCalls: 0 }, cost: undefined }, stats)
-    expect(folded.usage.modelCalls).toBe(2)
-    expect(folded.cost).toEqual({ amount: 0.000521, currency: 'USD' })
-    const meta = statsMeta(stats, folded)
-    expect(meta.dsh.turn).toMatchObject({ turn: 7, inputTokens: 2_200, modelMs: 1_600, toolMs: 500, ttftAvgMs: 750 })
-    expect(meta.dsh.session).toMatchObject({ modelCalls: 2, cost: { amount: 0.000521, currency: 'USD' } })
+    const folded = foldTurnStats(emptySessionStats(), stats)
+    expect(folded.usage).toEqual(stats.usage)
+    expect(folded.timing).toEqual(stats.timing)
+    expect(folded.cost).toEqual({ amount: 0.000791, currency: 'USD' })
+    const twice = foldTurnStats(folded, stats)
+    expect(twice.usage).toMatchObject({ uncachedInputTokens: 4_400, outputTokens: 160, modelCalls: 4 })
+    expect(twice.timing).toMatchObject({ llmMs: 6_400, toolMs: 1_000, decodeTokens: 160, ttftCalls: 4 })
+
+    const meta = statsMeta(stats, session)
+    expect(meta.dsh.turn).toMatchObject({
+      turn: 7,
+      uncachedInputTokens: 2_200,
+      cacheReadTokens: 800,
+      llmMs: 3_200,
+      toolMs: 500,
+      decodeMs: 1_700,
+      decodeTokens: 80,
+      ttftAvgMs: 750,
+      outputTps: 47.06,
+    })
+    expect(meta.dsh.session).toMatchObject({
+      uncachedInputTokens: 2_700,
+      llmMs: 9_400,
+      toolMs: 2_000,
+      ttftAvgMs: 720,
+      outputTps: 59.09,
+      cost: { amount: 0.001582, currency: 'USD' },
+    })
   })
 })
 
@@ -267,7 +277,7 @@ describe('bridge turn-stats delivery', () => {
     harness = undefined
   })
 
-  it('emits the card and a final usage_update with _meta after a completed turn', async () => {
+  it('emits a final usage_update with _meta and no stats card after a completed turn', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('hi')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
@@ -275,17 +285,16 @@ describe('bridge turn-stats delivery', () => {
     expect(result.stopReason).toBe('end_turn')
     await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
 
-    const card = harness.updates.find(update =>
+    // The markdown stats card is gone; the turn settles without any synthetic
+    // agent message beyond the model's own text.
+    const synthetic = harness.updates.filter(update =>
       update.sessionUpdate === 'agent_message_chunk' && 'messageId' in update && update.messageId?.startsWith('dsh-stats-'))
-    expect(card).toMatchObject({ sessionUpdate: 'agent_message_chunk', content: { type: 'text' } })
-    if (card?.sessionUpdate !== 'agent_message_chunk' || card.content.type !== 'text') throw new Error('expected card')
-    expect(card.content.text).toContain('**Turn stats')
-    expect(card.content.text).toContain('| Output | 2 |')
+    expect(synthetic).toEqual([])
 
     const final = harness.updates.at(-1)
     if (final?.sessionUpdate !== 'usage_update') throw new Error('expected final usage update')
     expect(final._meta?.dsh).toMatchObject({
-      turn: expect.objectContaining({ inputTokens: 5, modelCalls: 1 }),
+      turn: expect.objectContaining({ uncachedInputTokens: 5, modelCalls: 1 }),
       session: expect.objectContaining({ modelCalls: 1 }),
     })
     expect(final.cost).toBeUndefined()

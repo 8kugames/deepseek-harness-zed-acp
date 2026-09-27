@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
+import { assistantUpdates, availableCommandsUpdate, currentModeUpdate, sessionTitleUpdate, todoPlanUpdate, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -37,6 +39,32 @@ describe('standard ACP update projection', () => {
       seq: SessionSeq(0),
       time: 0,
       data: { turn: 1, step: 1, callId: ToolCallId('call-1'), name, arguments: callArguments },
+    }
+  }
+
+  /** Minimal committed tool-result event for completion-projection tests. */
+  function resultEvent(
+    toolCallId: string,
+    content: SessionEvent<'tool/result'>['data']['message']['content'],
+    isError = false,
+  ): SessionEvent<'tool/result'> {
+    return {
+      type: 'tool/result',
+      surfaceOp: 'append',
+      seq: SessionSeq(0),
+      time: 0,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: MessageId('tool-message'),
+          role: 'tool',
+          toolCallId: ToolCallId(toolCallId),
+          isError,
+          source: { kind: 'tool', callId: ToolCallId(toolCallId) },
+          content,
+        },
+      },
     }
   }
 
@@ -93,12 +121,12 @@ describe('standard ACP update projection', () => {
     })
 
     expect(call).toMatchObject({ rawInput: '{' })
-    expect(result).toEqual({
+    expect(result).toEqual([{
       sessionUpdate: 'tool_call_update',
       toolCallId: 'call-bad',
       status: 'failed',
       content: [],
-    })
+    }])
   })
 
   it('titles a terminal call with its one-line command and falls back to the tool name otherwise', () => {
@@ -139,5 +167,194 @@ describe('standard ACP update projection', () => {
       .toMatchObject({ title: 'job_kill', kind: 'execute' })
     expect(toolCallUpdate(callEvent('job_output', JSON.stringify({ job_id: 'job-7' }))))
       .toMatchObject({ title: 'job_output', kind: 'read' })
+  })
+  it('titles the reserved run_code PTC transport from its code body, not its description', () => {
+    // The run_code schema is { code: <async-fn body>, description: <summary> };
+    // the description is a prose label the model writes for the user, while
+    // code is the executed body the tool kinds=execute category ("Run Command"
+    // in Zed) should surface in the title strip. Listing code ahead of
+    // description in SALIENT_TITLE_FIELDS keeps the rendered title aligned
+    // with what the kind icon says the call is doing.
+    const body = 'const { execSync } = await import("node:child_process");\n'
+      + 'return execSync("git status --short", { encoding: "utf-8" })'
+    expect(toolCallUpdate(callEvent('run_code', JSON.stringify({
+      code: body,
+      description: 'Audit the projection',
+    })))).toMatchObject({
+      title: body.replace(/\s+/g, ' ').trim(),
+      kind: 'execute',
+    })
+
+    // Fallback contract still holds: when no salient field exists the tool
+    // name becomes the title, so a run_code call without description stays
+    // unambiguous in the strip.
+    expect(toolCallUpdate(callEvent('run_code', JSON.stringify({ code: body }))))
+      .toMatchObject({ title: body.replace(/\s+/g, ' ').trim(), kind: 'execute' })
+  })
+
+  it('attaches follow-along locations from file-shaped arguments', () => {
+    expect(toolCallUpdate(callEvent('read', JSON.stringify({ file_path: 'src/session.ts', offset: 5 }))))
+      .toMatchObject({ locations: [{ path: 'src/session.ts' }] })
+    // First probe key wins when several are present.
+    expect(toolCallUpdate(callEvent('edit', JSON.stringify({ path: 'a.ts', file_path: 'b.ts' }))))
+      .toMatchObject({ locations: [{ path: 'a.ts' }] })
+    // A url is not a location; calls without a file argument carry none.
+    expect(toolCallUpdate(callEvent('web_fetch', JSON.stringify({ url: 'https://zed.dev' }))))
+      .not.toHaveProperty('locations')
+    expect(toolCallUpdate(callEvent('bash', JSON.stringify({ command: 'ls' }))))
+      .not.toHaveProperty('locations')
+  })
+
+  it('replays locations on the completing update of a plain content result', async () => {
+    const result = await toolResultUpdate(
+      { get: () => undefined } as unknown as Context,
+      resultEvent('call-read', [{ type: 'text', text: 'body' }]),
+      { terminal: false, locations: [{ path: 'src/updates.ts' }] },
+    )
+    expect(result).toEqual([{
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-read',
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: 'body' } }],
+      locations: [{ path: 'src/updates.ts' }],
+    }])
+  })
+
+  it('embeds a display terminal on execute calls only when the client advertised it', () => {
+    const terminal = { enabled: true, cwd: '/work/repo' }
+    const embedded = toolCallUpdate(callEvent('bash', JSON.stringify({ command: 'ls' })), terminal)
+    expect(embedded).toMatchObject({
+      content: [{ type: 'terminal', terminalId: 'call-1' }],
+      _meta: { terminal_info: { terminal_id: 'call-1', cwd: '/work/repo' } },
+    })
+    // Non-execute kinds never take the terminal even with the capability.
+    const read = toolCallUpdate(callEvent('read', JSON.stringify({ file_path: 'a.ts' })), terminal)
+    expect(read).not.toHaveProperty('content')
+    expect(read).not.toHaveProperty('_meta')
+    // Without the capability nothing changes for any kind.
+    const plain = toolCallUpdate(callEvent('bash', JSON.stringify({ command: 'ls' })), { enabled: false, cwd: '/work' })
+    expect(plain).not.toHaveProperty('content')
+    expect(plain).not.toHaveProperty('_meta')
+  })
+
+  it('omits cwd from terminal_info when the session has none', () => {
+    const embedded = toolCallUpdate(
+      callEvent('bash', JSON.stringify({ command: 'ls' })),
+      { enabled: true, cwd: undefined },
+    )
+    expect(embedded).toMatchObject({ _meta: { terminal_info: { terminal_id: 'call-1' } } })
+    expect(embedded._meta).not.toHaveProperty('cwd')
+  })
+
+  it('settles a terminal call by streaming output then exiting with a synthesized code', async () => {
+    const ctx = { get: () => undefined } as unknown as Context
+    const call = { terminal: true, locations: undefined }
+    const settled = await toolResultUpdate(ctx, resultEvent('call-1', [{ type: 'text', text: 'total 0' }]), call)
+    expect(settled).toEqual([
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call-1',
+        _meta: { terminal_output: { terminal_id: 'call-1', data: 'total 0' } },
+      },
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'call-1',
+        status: 'completed',
+        rawOutput: { output: 'total 0', isError: false },
+        _meta: { terminal_exit: { terminal_id: 'call-1', exit_code: 0, signal: null } },
+      },
+    ])
+
+    // Empty output settles without a data payload; failure exits 1 and flags error.
+    const failed = await toolResultUpdate(
+      ctx,
+      resultEvent('call-1', [], true),
+      { terminal: true, locations: undefined },
+    )
+    expect(failed).toEqual([{
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-1',
+      status: 'failed',
+      rawOutput: { output: '', isError: true },
+      _meta: { terminal_exit: { terminal_id: 'call-1', exit_code: 1, signal: null } },
+    }])
+  })
+
+  it('projects the whole todo snapshot as the plan with medium priority', () => {
+    const event: SessionEvent<'todo/write'> = {
+      type: 'todo/write',
+      seq: SessionSeq(0),
+      time: 0,
+      data: {
+        todos: [
+          { content: 'Survey the seam ledger', status: 'completed' },
+          { content: 'Project the new updates', status: 'in_progress' },
+          { content: 'Run the review', status: 'pending' },
+          // Malformed entries are dropped rather than surfaced empty.
+          { content: '', status: 'pending' },
+          { status: 'pending' } as unknown as TodoItem,
+        ],
+      },
+    }
+    expect(todoPlanUpdate(event)).toEqual({
+      sessionUpdate: 'plan',
+      entries: [
+        { content: 'Survey the seam ledger', priority: 'medium', status: 'completed' },
+        { content: 'Project the new updates', priority: 'medium', status: 'in_progress' },
+        { content: 'Run the review', priority: 'medium', status: 'pending' },
+      ],
+    })
+
+    // An unrecognized status degrades to pending instead of fabricating a lifecycle.
+    const drifted: SessionEvent<'todo/write'> = {
+      type: 'todo/write',
+      seq: SessionSeq(1),
+      time: 0,
+      data: { todos: [{ content: 'Drifted entry', status: 'blocked' as unknown as 'pending' }] },
+    }
+    expect(todoPlanUpdate(drifted)).toMatchObject({ entries: [{ status: 'pending' }] })
+  })
+
+  it('projects a committed title as the session-info update', () => {
+    const event: SessionEvent<'session/title'> = {
+      type: 'session/title',
+      seq: SessionSeq(0),
+      time: 0,
+      data: { title: 'Fix the flaky bridge test', messageSeqs: [], source: { kind: 'fallback' } },
+    }
+    expect(sessionTitleUpdate(event)).toEqual({ sessionUpdate: 'session_info_update', title: 'Fix the flaky bridge test' })
+  })
+
+  it('lists effective commands one-to-one and dedupes shadowed names', () => {
+    const agent = {} as Agent
+    const commands = {
+      list: () => [
+        { name: 'init', description: 'Scaffold a workspace' },
+        { name: 'plan', description: 'Switch to plan mode', input: { hint: 'goal for the plan' } },
+        // A scoped shadow carrying the same name keeps only the first listing.
+        { name: 'init', description: 'Shadowed duplicate' },
+      ],
+    }
+    expect(availableCommandsUpdate(commands, agent)).toEqual({
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [
+        { name: 'init', description: 'Scaffold a workspace' },
+        { name: 'plan', description: 'Switch to plan mode', input: { hint: 'goal for the plan' } },
+      ],
+    })
+    // Without a composed registry there is nothing to publish.
+    expect(availableCommandsUpdate(undefined, agent)).toBeUndefined()
+  })
+
+  it('projects committed plan-mode switches onto the advertised mode ids', () => {
+    const active: SessionEvent<'plan/mode'> = {
+      type: 'plan/mode',
+      seq: SessionSeq(0),
+      time: 0,
+      data: { active: true },
+    }
+    expect(currentModeUpdate(active)).toEqual({ sessionUpdate: 'current_mode_update', currentModeId: 'plan' })
+    const idle: SessionEvent<'plan/mode'> = { ...active, data: { active: false } }
+    expect(currentModeUpdate(idle)).toEqual({ sessionUpdate: 'current_mode_update', currentModeId: 'default' })
   })
 })

@@ -2,14 +2,19 @@
  * Turn-scoped token and timing statistics derived from committed DSH events,
  * plus DeepSeek list pricing for cumulative session cost reporting.
  *
- * Timing reads the durable facts themselves: `step/start` anchors each model
- * call, the assistant stream records carry per-chunk times, and tool duration
- * is the `tool/call` → `tool/result` gap. Nothing here watches the clock at
- * projection time, so replayed facts reproduce identical numbers.
+ * Buckets and timings follow the upstream dsh definitions: `dsh-token-meter`
+ * maps `TokenUsage.inputTokens` onto its own `uncachedInputTokens`, so prompt
+ * input is three disjoint buckets (`uncachedInputTokens` / `cacheReadTokens` /
+ * `cacheWriteTokens`); wall time is `step/start → assistant/message` per model
+ * call (`llmMs`) plus `tool/call → tool/result` (`toolMs`); first-token latency
+ * is `step/start → first token delta`; and decode time is `first token delta →
+ * assistant/message`, counted — together with that step's output tokens — only
+ * for steps that recorded both. Nothing here watches the clock at projection
+ * time, so replayed facts reproduce identical numbers.
  * @module @8kugames/dsh-zed-acp/stats
  */
 
-import { assistantStreamFirstTokenTime, type AssistantStreamRecord, type TokenUsage } from '@deepseek-ai/dsh-llm'
+import { assistantStreamFirstTokenTime, type TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 
 /** Per-1M-token prices for one pricing tier. */
@@ -144,17 +149,17 @@ export function resolvePrice(table: PriceTable, model: string, atMs: number): Re
 }
 
 /**
- * Price one usage record: cache-read tokens at the hit rate, the remaining
- * input at the miss rate (DeepSeek bills cache writes as misses), output at
- * the out rate.
+ * Price one usage record with dsh's disjoint prompt buckets: cache-read tokens
+ * at the hit rate, uncached input plus cache writes at the miss rate (DeepSeek
+ * bills writes as misses), output at the out rate.
  * @param rates - per-1M prices.
- * @param usage - one model call's accounting.
+ * @param usage - one model call's accounting; `inputTokens` is uncached input.
  * @returns cost in the entry's currency unit.
  */
 export function priceUsage(rates: UsagePrice, usage: TokenUsage): number {
-  const cached = usage.cacheReadTokens ?? 0
-  const uncached = Math.max(0, usage.inputTokens - cached)
-  return (cached * rates.hit + uncached * rates.miss + usage.outputTokens * rates.out) / 1_000_000
+  const read = usage.cacheReadTokens ?? 0
+  const write = usage.cacheWriteTokens ?? 0
+  return (read * rates.hit + (usage.inputTokens + write) * rates.miss + usage.outputTokens * rates.out) / 1_000_000
 }
 
 /**
@@ -174,29 +179,38 @@ export function buildPriceTable(env: string | undefined, warn: (message: string)
   }
 }
 
-/** Cumulative token accounting across the model calls of one scope. */
+/** Cumulative token accounting across the model calls of one scope, in dsh buckets. */
 export interface UsageTotals {
-  inputTokens: number
+  /** Prompt input billed at the miss rate — dsh's own `uncachedInputTokens`. */
+  uncachedInputTokens: number
   outputTokens: number
   cacheReadTokens?: number
   cacheWriteTokens?: number
-  reasoningTokens?: number
   /** Model calls that reported usage. */
   modelCalls: number
+}
+
+/** Wall-time aggregates shared by one turn and by the whole session, in dsh's terms. */
+export interface TimingTotals {
+  /** Σ per model call of (assistant/message − step/start): request to settlement. */
+  llmMs: number
+  /** Σ over tool calls of (tool/result − tool/call). */
+  toolMs: number
+  /** Σ per model call of (assistant/message − first token): decode wall time. */
+  decodeMs: number
+  /** Σ output tokens over the same decode-timed steps as {@link decodeMs}. */
+  decodeTokens: number
+  /** Σ per model call of (first token − step start). */
+  ttftSumMs: number
+  /** Model calls that recorded a first token. */
+  ttftCalls: number
 }
 
 /** Final statistics for one Agent turn, priced where the model is listed. */
 export interface TurnStats {
   turn: number
   usage: UsageTotals
-  /** Σ per model call of (last stream chunk − step start): request to stream end. */
-  modelMs: number
-  /** Σ over tool calls of (tool/result − tool/call). */
-  toolMs: number
-  /** Σ per model call of (last chunk − first token): the visible decode window. */
-  outputMs: number
-  /** Per model call, first-token time minus that call's step start. */
-  ttftSamplesMs: number[]
+  timing: TimingTotals
   /** Priced cost of this turn's usage, when every listing resolved. */
   cost: { amount: number; currency: string } | undefined
 }
@@ -204,31 +218,59 @@ export interface TurnStats {
 /** Session-lifetime totals kept by the ACP session for final updates. */
 export interface SessionStats {
   usage: UsageTotals
+  timing: TimingTotals
   /** Cumulative cost across live turns since this ACP session opened. */
   cost: { amount: number; currency: string } | undefined
 }
 
-/** Last chunk time across one settlement's compact stream records. */
-function lastStreamTime(stream: readonly AssistantStreamRecord[]): number | undefined {
-  let last: number | undefined
-  for (const record of stream) {
-    const time = record.type === 'chunk' ? record.time : record.time0 + record.dt.reduce((sum, delta) => sum + delta, 0)
-    if (last === undefined || time > last) last = time
-  }
-  return last
+/** A fresh, all-zero timing aggregate. */
+function zeroTiming(): TimingTotals {
+  return { llmMs: 0, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 }
 }
 
-/** Add one call's usage into running totals, preserving reported cache fields. */
-function addUsage(totals: UsageTotals, usage: TokenUsage): UsageTotals {
-  const read = (totals.cacheReadTokens ?? 0) + (usage.cacheReadTokens ?? 0)
-  const write = (totals.cacheWriteTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
-  const reasoning = (totals.reasoningTokens ?? 0) + (usage.reasoningTokens ?? 0)
+/** Add one scope's timings into another; the speed pairing stays step-level. */
+function mergeTiming(totals: TimingTotals, timing: TimingTotals): TimingTotals {
   return {
-    inputTokens: totals.inputTokens + usage.inputTokens,
-    outputTokens: totals.outputTokens + usage.outputTokens,
+    llmMs: totals.llmMs + timing.llmMs,
+    toolMs: totals.toolMs + timing.toolMs,
+    decodeMs: totals.decodeMs + timing.decodeMs,
+    decodeTokens: totals.decodeTokens + timing.decodeTokens,
+    ttftSumMs: totals.ttftSumMs + timing.ttftSumMs,
+    ttftCalls: totals.ttftCalls + timing.ttftCalls,
+  }
+}
+
+/** A fresh session aggregate: no usage, timing, or cost recorded yet. */
+export function emptySessionStats(): SessionStats {
+  return {
+    usage: { uncachedInputTokens: 0, outputTokens: 0, modelCalls: 0 },
+    timing: zeroTiming(),
+    cost: undefined,
+  }
+}
+
+/** One call's prompt/output accounting, as reported or as already folded. */
+interface UsageSample {
+  /** Prompt input outside cache; dsh's own `uncachedInputTokens`. */
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+}
+
+/**
+ * Merge one call's accounting into running totals, preserving reported cache
+ * fields. `inputTokens` is uncached input in dsh's bucket vocabulary, so it
+ * lands in `uncachedInputTokens` rather than being netted against cache.
+ */
+function mergeUsage(totals: UsageTotals, sample: UsageSample): UsageTotals {
+  const read = (totals.cacheReadTokens ?? 0) + (sample.cacheReadTokens ?? 0)
+  const write = (totals.cacheWriteTokens ?? 0) + (sample.cacheWriteTokens ?? 0)
+  return {
+    uncachedInputTokens: totals.uncachedInputTokens + sample.inputTokens,
+    outputTokens: totals.outputTokens + sample.outputTokens,
     cacheReadTokens: read === 0 ? undefined : read,
     cacheWriteTokens: write === 0 ? undefined : write,
-    reasoningTokens: reasoning === 0 ? undefined : reasoning,
     modelCalls: totals.modelCalls + 1,
   }
 }
@@ -246,11 +288,8 @@ function round6(value: number): number {
 export class TurnStatsCollector {
   private readonly stepStarts = new Map<number, number>()
   private readonly toolStarts = new Map<string, number>()
-  private usage: UsageTotals = { inputTokens: 0, outputTokens: 0, modelCalls: 0 }
-  private modelMs = 0
-  private toolMs = 0
-  private outputMs = 0
-  private readonly ttftSamplesMs: number[] = []
+  private usage: UsageTotals = { uncachedInputTokens: 0, outputTokens: 0, modelCalls: 0 }
+  private timing: TimingTotals = zeroTiming()
   private costAmount = 0
   private costCurrency: string | undefined
 
@@ -284,7 +323,7 @@ export class TurnStatsCollector {
       const start = this.toolStarts.get(event.data.message.toolCallId)
       if (start === undefined) return
       this.toolStarts.delete(event.data.message.toolCallId)
-      this.toolMs += Math.max(0, event.time - start)
+      this.timing.toolMs += Math.max(0, event.time - start)
       return
     }
     if (event.type === 'assistant/message') {
@@ -292,14 +331,20 @@ export class TurnStatsCollector {
       const { stream, usage } = event.data
       const start = this.stepStarts.get(event.data.step)
       const first = assistantStreamFirstTokenTime(stream)
-      const last = lastStreamTime(stream)
-      if (start !== undefined) {
-        if (first !== undefined) this.ttftSamplesMs.push(Math.max(0, first - start))
-        this.modelMs += Math.max(0, (last ?? event.time) - start)
+      if (start !== undefined) this.timing.llmMs += Math.max(0, event.time - start)
+      if (first !== undefined) {
+        if (start !== undefined) {
+          this.timing.ttftSumMs += Math.max(0, first - start)
+          this.timing.ttftCalls += 1
+        }
+        // Upstream pairs decode wall time with that step's output tokens and
+        // counts both only together, so a step without recorded stream timing
+        // contributes no speed reading instead of inflating one.
+        this.timing.decodeMs += Math.max(0, event.time - first)
+        if (usage !== undefined) this.timing.decodeTokens += usage.outputTokens
       }
-      if (first !== undefined && last !== undefined && last > first) this.outputMs += last - first
       if (usage === undefined) return
-      this.usage = addUsage(this.usage, usage)
+      this.usage = mergeUsage(this.usage, usage)
       const priced = resolvePrice(this.prices, this.modelId() ?? '', event.time)
       if (priced !== undefined) {
         this.costAmount += priceUsage(priced.rates, usage)
@@ -317,10 +362,7 @@ export class TurnStatsCollector {
     return {
       turn: this.turn,
       usage: this.usage,
-      modelMs: this.modelMs,
-      toolMs: this.toolMs,
-      outputMs: this.outputMs,
-      ttftSamplesMs: this.ttftSamplesMs,
+      timing: this.timing,
       cost: this.costCurrency === undefined
         ? undefined
         : { amount: round6(this.costAmount), currency: this.costCurrency },
@@ -335,8 +377,13 @@ export class TurnStatsCollector {
  * @returns the next session totals snapshot.
  */
 export function foldTurnStats(session: SessionStats, turn: TurnStats): SessionStats {
+  const read = (session.usage.cacheReadTokens ?? 0) + (turn.usage.cacheReadTokens ?? 0)
+  const write = (session.usage.cacheWriteTokens ?? 0) + (turn.usage.cacheWriteTokens ?? 0)
   const usage: UsageTotals = {
-    ...addUsage(session.usage, turn.usage),
+    uncachedInputTokens: session.usage.uncachedInputTokens + turn.usage.uncachedInputTokens,
+    outputTokens: session.usage.outputTokens + turn.usage.outputTokens,
+    cacheReadTokens: read === 0 ? undefined : read,
+    cacheWriteTokens: write === 0 ? undefined : write,
     modelCalls: session.usage.modelCalls + turn.usage.modelCalls,
   }
   const cost = turn.cost === undefined
@@ -345,84 +392,45 @@ export function foldTurnStats(session: SessionStats, turn: TurnStats): SessionSt
         amount: round6((session.cost?.amount ?? 0) + turn.cost.amount),
         currency: turn.cost.currency,
       }
-  return { usage, cost }
+  return { usage, timing: mergeTiming(session.timing, turn.timing), cost }
 }
 
-/** Format a millisecond duration compactly for the stats card. */
-function formatMs(ms: number): string {
-  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+/** Average first-token latency of a scope, or undefined when no call recorded one. */
+function ttftAvgMs(timing: TimingTotals): number | undefined {
+  return timing.ttftCalls === 0 ? undefined : Math.round(timing.ttftSumMs / timing.ttftCalls)
 }
 
-/** Format a currency amount with stable precision. */
-function formatMoney(amount: number, currency: string): string {
-  return currency === 'USD' ? `$${amount.toFixed(4)}` : `${amount.toFixed(4)} ${currency}`
-}
-
-/**
- * Render the end-of-turn statistics card as the markdown text of one ACP
- * agent message. Cache rows appear only when the adapter reported them;
- * timing and cost segments appear only when their facts exist.
- * @param turn - finalized turn statistics.
- * @param session - session-lifetime totals for the cumulative line.
- * @param modelId - model selection that served the turn, if known.
- * @returns the card's markdown text.
- */
-export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId: string | undefined): string {
-  const lines: string[] = []
-  const title = modelId === undefined ? 'Turn stats' : `Turn stats · ${modelId}`
-  lines.push(`**${title}** — model ${formatMs(turn.modelMs)} · tools ${formatMs(turn.toolMs)}`, '')
-  lines.push('| | tokens |', '|---|---:|')
-  const read = turn.usage.cacheReadTokens
-  const write = turn.usage.cacheWriteTokens
-  if (read !== undefined) lines.push(`| Input · cache read | ${read.toLocaleString('en-US')} |`)
-  if (write !== undefined) lines.push(`| Input · cache write | ${write.toLocaleString('en-US')} |`)
-  const cached = (read ?? 0) + (write ?? 0)
-  lines.push(`| Input · uncached | ${Math.max(0, turn.usage.inputTokens - cached).toLocaleString('en-US')} |`)
-  lines.push(`| Output | ${turn.usage.outputTokens.toLocaleString('en-US')} |`)
-  if ((turn.usage.reasoningTokens ?? 0) > 0) {
-    lines.push(`| Output · reasoning | ${(turn.usage.reasoningTokens ?? 0).toLocaleString('en-US')} |`)
-  }
-  lines.push('')
-  const tail: string[] = []
-  if (turn.ttftSamplesMs.length > 0) {
-    const avg = turn.ttftSamplesMs.reduce((sum, sample) => sum + sample, 0) / turn.ttftSamplesMs.length
-    tail.push(`avg first token ${formatMs(avg)}`)
-  }
-  if (turn.outputMs >= 50) tail.push(`output ${(turn.usage.outputTokens / (turn.outputMs / 1000)).toFixed(1)} tok/s`)
-  if (turn.cost !== undefined) tail.push(`turn ${formatMoney(turn.cost.amount, turn.cost.currency)}`)
-  if (session.cost !== undefined) tail.push(`session ${formatMoney(session.cost.amount, session.cost.currency)}`)
-  if (tail.length > 0) lines.push(tail.join(' · '))
-  return lines.join('\n')
+/** Decode speed of a scope over the steps that recorded both parts, or undefined. */
+function outputTps(timing: TimingTotals): number | undefined {
+  return timing.decodeMs > 0 ? timing.decodeTokens / (timing.decodeMs / 1000) : undefined
 }
 
 /**
  * Build the forward-compatibility `_meta` payload for the final usage update:
- * the same facts the card renders, in machine-readable form under a `dsh`
- * namespace ACP clients may ignore.
+ * the turn's and session's accounting facts in machine-readable form under a
+ * `dsh` namespace ACP clients may ignore.
  * @param turn - finalized turn statistics.
  * @param session - session-lifetime totals.
  * @returns the `_meta` object for `usage_update`.
  */
 export function statsMeta(turn: TurnStats, session: SessionStats): { dsh: Record<string, unknown> } {
-  const ttftAvg = turn.ttftSamplesMs.length === 0
-    ? undefined
-    : Math.round(turn.ttftSamplesMs.reduce((sum, sample) => sum + sample, 0) / turn.ttftSamplesMs.length)
+  const scope = (usage: UsageTotals, timing: TimingTotals, cost: { amount: number; currency: string } | undefined) => {
+    const tps = outputTps(timing)
+    return {
+      ...usage,
+      llmMs: timing.llmMs,
+      toolMs: timing.toolMs,
+      decodeMs: timing.decodeMs,
+      decodeTokens: timing.decodeTokens,
+      ttftAvgMs: ttftAvgMs(timing),
+      outputTps: tps === undefined ? undefined : Number(tps.toFixed(2)),
+      cost,
+    }
+  }
   return {
     dsh: {
-      turn: {
-        turn: turn.turn,
-        ...turn.usage,
-        modelMs: turn.modelMs,
-        toolMs: turn.toolMs,
-        outputMs: turn.outputMs,
-        ttftAvgMs: ttftAvg,
-        outputTps: turn.outputMs >= 50 ? Number((turn.usage.outputTokens / (turn.outputMs / 1000)).toFixed(2)) : undefined,
-        cost: turn.cost,
-      },
-      session: {
-        ...session.usage,
-        cost: session.cost,
-      },
+      turn: { turn: turn.turn, ...scope(turn.usage, turn.timing, turn.cost) },
+      session: scope(session.usage, session.timing, session.cost),
     },
   }
 }
