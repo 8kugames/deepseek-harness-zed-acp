@@ -5,6 +5,8 @@
 
 ## [未发布]
 
+## [0.1.1] - 2026-09-28
+
 ### 新增
 
 - 工具调用 `locations`: `tool_call` 与完成的 `tool_call_update` 从文件型参数（`path`/`file_path`/`filePath`/`file`）携带标准跟随式位置，供客户端的 follow-along 特性使用。
@@ -55,5 +57,6 @@
 - 双语 README 与 docs/zed-acp（英 / 中）。
 - `THIRD_PARTY_NOTICES.md` 列明运行时依赖与宿主 peer 依赖的版本与许可。
 
-[未发布]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.1.0...HEAD
+[未发布]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.1.1...HEAD
+[0.1.1]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.1
 [0.1.0]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.0
