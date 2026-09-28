@@ -72,6 +72,90 @@ describe('automation-only ACP bridge', () => {
     expect(noStore.agentCapabilities?.promptCapabilities?.image).toBe(false)
   })
 
+  it('honors the deployment imageInputs override over incomplete adapter metadata', async () => {
+    // The route declares text-only input, which the strict probe refuses to advertise.
+    harness = await makeBridgeHarness({ imageCapable: false, config: { imageInputs: 'auto' } })
+    const strict = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(strict.agentCapabilities?.promptCapabilities?.image).toBe(false)
+    await harness.dispose()
+
+    // `true` is the deployment's promise: advertise whenever a store is mounted,
+    // however little the adapter catalog discloses.
+    harness = await makeBridgeHarness({ imageCapable: false, config: { imageInputs: true } })
+    const forced = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(forced.agentCapabilities?.promptCapabilities?.image).toBe(true)
+    await harness.dispose()
+
+    // A deployment that mounts no store still cannot take an image.
+    harness = await makeBridgeHarness({ imageCapable: false, attachments: false, config: { imageInputs: true } })
+    const noStore = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(noStore.agentCapabilities?.promptCapabilities?.image).toBe(false)
+    await harness.dispose()
+
+    // `false` never advertises, whatever the route declares.
+    harness = await makeBridgeHarness({ imageCapable: true, config: { imageInputs: false } })
+    const disabled = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(disabled.agentCapabilities?.promptCapabilities?.image).toBe(false)
+    await harness.dispose()
+  })
+
+  it('seeds the initial selection and image advertisement from the composition default route', async () => {
+    // Unpinned deployment: fresh sessions start on the composition's
+    // agent-default-model selection, and the image probe follows that route.
+    harness = await makeBridgeHarness({
+      imageCapable: true,
+      defaultModel: { provider: 'mock', model: 'mock' },
+      config: { provider: undefined, model: undefined },
+    })
+    const capable = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(capable.agentCapabilities?.promptCapabilities?.image).toBe(true)
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    expect(created.configOptions?.find(option => option.id === 'model')).toMatchObject({
+      category: 'model',
+      currentValue: '["mock","mock"]',
+    })
+    await harness.dispose()
+
+    // Without the service and without a pin there is no route to probe and no
+    // initial selection: the bridge stays silent on images.
+    harness = await makeBridgeHarness({ imageCapable: true, config: { provider: undefined, model: undefined } })
+    const silent = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(silent.agentCapabilities?.promptCapabilities?.image).toBe(false)
+    await harness.dispose()
+  })
+
+  it('probes a pinned provider/model over the composition default route', async () => {
+    // An explicit deployment pin overrides the composition default for the
+    // sessions it creates, so the probe must target the pinned route.
+    harness = await makeBridgeHarness({
+      imageCapable: true,
+      defaultModel: { provider: 'mock', model: 'mock' },
+      config: { provider: 'text-only', model: 'route' },
+    })
+    harness.registerCatalogProvider('text-only')
+    const pinned = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    expect(pinned.agentCapabilities?.promptCapabilities?.image).toBe(false)
+    await harness.dispose()
+  })
+
+  it('still refuses an image on a text-only route the override advertised', async () => {
+    // The advertised capability is the composer's affordance; the per-prompt
+    // route check stays the safety net for models that genuinely reject images.
+    harness = await makeBridgeHarness({
+      imageCapable: false,
+      script: [textResponse('never reached')],
+      config: { imageInputs: true },
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    await expect(harness.client.prompt({
+      sessionId,
+      prompt: [{ type: 'image', data: 'AQ==', mimeType: 'image/png' }],
+    })).rejects.toThrow(/does not declare image input/)
+    expect(harness.attachments?.saved).toHaveLength(0)
+  })
+
   it('negotiates an unsupported version and authenticates the advertised method', async () => {
     harness = await makeBridgeHarness({ config: { apiKeyEnv: 'ACP_BRIDGE_AUTH_KEY' } })
     const response = await harness.client.initialize({ protocolVersion: 0, clientCapabilities: {} })
@@ -636,8 +720,10 @@ describe('automation-only ACP bridge', () => {
       configId: 'reasoning_effort',
       value: low.value,
     })
+    // The preset realm supplies this session's plan mode, so the mode select
+    // joins the advertised set between the permission and model selects.
     expect(reselected.configOptions.map(option => option.id))
-      .toEqual(['preset', 'permission', 'model', 'reasoning_effort'])
+      .toEqual(['preset', 'permission', 'session_mode', 'model', 'reasoning_effort'])
 
     const model = created.configOptions?.find(option => option.id === 'model')
     if (model?.type !== 'select') throw new Error('expected a model select option')
@@ -650,8 +736,9 @@ describe('automation-only ACP bridge', () => {
       configId: 'model',
       value: plain.value,
     })
+    // The route with no declared reasoning effort drops only its own select.
     expect(switched.configOptions.map(option => option.id))
-      .toEqual(['preset', 'permission', 'model'])
+      .toEqual(['preset', 'permission', 'session_mode', 'model'])
   })
 
   it('rejects unknown config choices without changing the selected route', async () => {

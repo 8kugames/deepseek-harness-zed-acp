@@ -2,8 +2,8 @@
  * Zed-oriented Agent Client Protocol server over JSON-RPC stdio.
  *
  * The bridge exposes persistent harness sessions to interactive ACP clients
- * such as Zed. It carries standard configuration, agent-preset and permission
- * selects, default/plan session modes, MCP mounts, prompt content, committed
+ * such as Zed. It carries standard configuration, agent-preset, permission, and
+ * default/plan session-mode selects, MCP mounts, prompt content, committed
  * semantic updates with tool kinds and file diffs, credential authentication,
  * one-shot permission decisions, and option-only user questions; presentation
  * features that need a richer client stay with the harness's UI modules.
@@ -56,19 +56,22 @@ import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { SessionId, SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type imports: declaration-merge the approval waterfall answered
-// below, the user-questions waterfall the questions bridge answers, and the
+// below, the user-questions waterfall the questions bridge answers, the
+// optional default-model selection the initial route resolves through, and the
 // optional projection cache the session-list title read resolves through.
+import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-user-questions'
 import { authenticate as authenticateCredential, acpAuthMethods, resolveApiKeyRef } from './auth.ts'
-import { supportsAcpImagePrompts } from './content.ts'
+import { mountsAcpImageAttachments, supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
 import { AcpPermissionConfigError } from './permission-control.ts'
 import { AcpPresetConfigError } from './preset-control.ts'
+import { AcpSessionModeConfigError } from './session-mode-control.ts'
 import { bridgeAcpQuestions } from './questions.ts'
 import { AcpSession } from './session.ts'
 import { buildPriceTable } from './stats.ts'
@@ -104,6 +107,15 @@ export interface AcpConfig {
   apiKeyEnv?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
+  /**
+   * Whether to advertise inline image prompts when the attachment store is
+   * mounted. `'auto'` (the default) requires the route a fresh session starts
+   * on — the pinned provider/model, else the composition's default model — to
+   * declare image input; `true` is the deployment's explicit promise, for
+   * adapters whose catalog omits `inputModalities`, and still refuses such a
+   * route at admission time; `false` never advertises them.
+   */
+  imageInputs?: 'auto' | boolean
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -113,7 +125,29 @@ export const Config: Schema<AcpConfig> = Schema.object({
   model: Schema.string(),
   apiKeyEnv: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
+  imageInputs: Schema.union([Schema.const('auto'), Schema.boolean()]).default('auto'),
 })
+
+/**
+ * Decide the `promptCapabilities.image` this connection advertises. The
+ * `promptCapabilities` block is the agent's promise to the client, so a
+ * deployment may state it explicitly; the per-prompt route check stays the
+ * safety net for routes that really cannot accept an image.
+ * @param ctx - bridge context carrying the optional attachment and LLM services.
+ * @param config - deployment configuration for this connection.
+ * @returns whether inline image prompts are advertised.
+ */
+async function resolveImagePromptCapability(ctx: Context, config: AcpConfig): Promise<boolean> {
+  const override = config.imageInputs ?? 'auto'
+  if (override === 'auto') {
+    // Probe the exact route a fresh session starts on, so the advertised
+    // capability matches what the first prompt will actually run on.
+    const selection = initialSelection(ctx, config)
+    return supportsAcpImagePrompts(ctx, selection?.provider, selection?.model)
+  }
+  if (override === false) return false
+  return mountsAcpImageAttachments(ctx)
+}
 
 /**
  * Mount the Zed-oriented ACP server.
@@ -230,7 +264,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     async initialize(params: InitializeRequest): Promise<InitializeResponse> {
       // Single-version agent: the spec's "same version if supported, else
       // the latest supported" both resolve to this server's one version.
-      imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
+      imagePromptEnabled = await resolveImagePromptCapability(ctx, config)
       clientTerminalOutput = params.clientCapabilities?._meta?.terminal_output === true
       return {
         protocolVersion: PROTOCOL_VERSION,
@@ -259,7 +293,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           cwd: params.cwd,
           mcpServers: params.mcpServers,
           agentOptions: agentOptions(config),
-          fallbackSelection: initialSelection(config),
+          fallbackSelection: initialSelection(ctx, config),
           signal,
           notify,
           prices,
@@ -319,7 +353,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             cwd: params.cwd,
             mcpServers: params.mcpServers ?? [],
             agentOptions: agentOptions(config),
-            fallbackSelection: initialSelection(config),
+            fallbackSelection: initialSelection(ctx, config),
             signal,
             notify,
             prices,
@@ -416,6 +450,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           error instanceof AcpModelConfigError
           || error instanceof AcpPresetConfigError
           || error instanceof AcpPermissionConfigError
+          || error instanceof AcpSessionModeConfigError
         ) {
           throw invalidParams(error.message)
         }
@@ -544,11 +579,20 @@ function agentOptions(config: AcpConfig): { provider?: string; model?: string } 
   }
 }
 
-/** Initial session selection when both deployment fields are present. */
-function initialSelection(config: AcpConfig): ModelSelection | undefined {
-  return config.provider === undefined || config.model === undefined
-    ? undefined
-    : { provider: config.provider, model: config.model }
+/**
+ * The route a fresh session starts on: the deployment's explicit provider/model
+ * pin when both fields are present, else the composition's default-model
+ * selection. `undefined` when neither composes; the agent loop then supplies
+ * no route up front.
+ * @param ctx - bridge context carrying the optional agent-default-model service.
+ * @param config - ACP provider/model configuration.
+ * @returns the initial session selection, or `undefined` when neither composes.
+ */
+function initialSelection(ctx: Context, config: AcpConfig): ModelSelection | undefined {
+  if (config.provider !== undefined && config.model !== undefined) {
+    return { provider: config.provider, model: config.model }
+  }
+  return ctx.get('agentDefaultModel')?.currentSelection()
 }
 
 /**

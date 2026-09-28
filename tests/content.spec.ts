@@ -7,6 +7,7 @@ import {
   AcpContentError,
   admitAcpPrompt,
   assistantBlockToAcp,
+  mountsAcpImageAttachments,
   supportsAcpImagePrompts,
 } from '../src/content.ts'
 
@@ -83,6 +84,32 @@ describe('ACP rich content codec', () => {
     await expect(supportsAcpImagePrompts(absent(store, unknownLlm), 'p', 'm')).resolves.toBe(false)
     await expect(supportsAcpImagePrompts(absent(store, textLlm), 'p', 'm')).resolves.toBe(false)
     await expect(supportsAcpImagePrompts(absent(store, imageLlm), 'p', 'm')).resolves.toBe(true)
+  })
+
+  it('probes the attachment store alone for the route-independent override', async () => {
+    const absent = (attachments: unknown): Context => ({
+      get: (name: string) => name === 'attachments' ? attachments : undefined,
+    }) as unknown as Context
+
+    // The override promises image input to the client, so it must not consult
+    // the catalog — only whether the store can hold a supported raster format.
+    expect(mountsAcpImageAttachments(absent({ imageLimits: { mediaTypes: ['image/png'] } }))).toBe(true)
+    expect(mountsAcpImageAttachments(absent({ imageLimits: { mediaTypes: ['application/pdf'] } }))).toBe(false)
+    expect(mountsAcpImageAttachments(absent(undefined))).toBe(false)
+  })
+
+  it('refuses an image on a text-only route even when the capability was advertised', async () => {
+    // The initialize-time capability is the client's composer affordance; the
+    // per-prompt route check remains the safety net that catches a model
+    // whose catalog does not accept images.
+    const fixture = admissionFixture()
+    fixture.resolveModelInfo.mockResolvedValueOnce({
+      provider: 'mock', id: 'vision', name: 'vision', inputModalities: ['text'],
+    })
+    await expect(admitAcpPrompt(fixture.ctx, fixture.route, [
+      { type: 'image', data: 'AQ==', mimeType: 'image/png' },
+    ], true, new AbortController().signal)).rejects.toThrow(/does not declare image input/)
+    expect(fixture.saveImages).not.toHaveBeenCalled()
   })
 
   it('validates every rich wire block before any image write', async () => {

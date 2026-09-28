@@ -3,7 +3,24 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.0] - 2026-09-29
+
+### 变更
+
+- peer 依赖与开发依赖从 `0.1.7-rc.2` 全面对齐到 `0.2.0-rc.1`，使插件可安装在 dsh `0.2.0-rc.1` 运行时上（旧声明会被插件管理器以 peerDependencies 不兼容为由拒绝安装）。
+
+### 新增
+
+- 协作模式选择器：桥在 `session/new` / `session/resume` 的 `configOptions` 中发布 `category: "mode"` 的 `session_mode` 选项（Default / Plan），与旧的 `modes` 字段并存。两条路径都收敛到同一份 `planMode` 状态，切换后以既有的 `current_mode_update` 通知客户端；未组合 plan-mode 的部署不发布该选项。
+- `imageInputs` 配置项：`'auto'`（默认）保持"路由必须声明图像输入"的严格探测；`true` 在挂载了附件存储时无条件声明图像输入，供目录未披露 `inputModalities` 的适配器使用；`false` 永不声明。无论取哪个值，逐条提示的路由校验仍然拒绝真正不接受图像的模型。
+- `minimal` 预设补齐 `plan-mode` 组合（与 standard / ptc / cordis 一致的 `planning` 分组与 guidance section）。
+
+### 修复
+
+- 初始化时的图像能力探测不再使用插件配置里静态钉死的 provider/model，而是探测新会话实际起始的路由（显式 pin 优先，其次组合的 agent-default-model 默认选择）。此前部署中 pin 指向已退役或不存在的模型 id 时，`promptCapabilities.image` 恒为 false，Zed 端完全无法输入图片。
+- 初始模型选择（model/reasoning 芯片的 current 值与新会话回退路由）同样回填自 agent-default-model；bundle 层不再默认钉死 `deepseek-official/deepseek-v4-flash`（已退役 id），新会话直接继承组合默认模型，与 bundle 注释宣称的设计一致。
+- Zed 代理面板此前没有模式选择器：桥只发布旧的 `SessionModeState`，而当前 Zed 走 `category: "mode"` 的配置项路径，`modes` 字段仅作兼容。
+- 选中 `minimal` 预设（或默认落到它）时该预设未组合 `plan-mode`，模式切换静默不可用。
 
 ## [0.1.1] - 2026-09-28
 
@@ -57,6 +74,7 @@
 - 双语 README 与 docs/zed-acp（英 / 中）。
 - `THIRD_PARTY_NOTICES.md` 列明运行时依赖与宿主 peer 依赖的版本与许可。
 
-[未发布]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.1.1...HEAD
+[未发布]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.0...HEAD
+[0.2.0]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.1.1...zed-acp-v0.2.0
 [0.1.1]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.1
 [0.1.0]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.0

@@ -1,14 +1,14 @@
 {
   "id": "dsh-zed-acp",
   "name": "DeepSeek Harness (Zed ACP)",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "DeepSeek Harness coding agent over the Agent Client Protocol: persistent sessions, plan mode, agent presets, permission presets, and MCP support, driven by the dsh --profile zed server (@8kugames/dsh-zed-acp).",
   "repository": "https://github.com/8kugames/dsh-zed-acp",
   "authors": ["8kugames"],
   "license": "MIT",
   "distribution": {
     "npx": {
-      "package": "@deepseek-ai/dsh@0.1.7-rc.2",
+      "package": "@deepseek-ai/dsh@0.2.0-rc.1",
       "args": ["--profile", "zed"]
     }
   }

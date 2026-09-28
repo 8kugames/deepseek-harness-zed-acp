@@ -95,4 +95,93 @@ describe('ACP session modes', () => {
     // The host controller stays untouched: the session's own composition owns its plan mode.
     expect(harness.ctx.planMode.get(agent).active).toBe(false)
   })
+
+  it('advertises the mode select alongside the legacy mode state', async () => {
+    const bridge = await harnessWithModes()
+    const response = await bridge.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    // Clients that render the modern selector read this option; the legacy
+    // `modes` field stays for clients that only implement the deprecated path.
+    expect(response.configOptions?.find(option => option.id === 'session_mode')).toEqual({
+      id: 'session_mode',
+      name: 'Mode',
+      category: 'mode',
+      type: 'select',
+      currentValue: 'default',
+      options: [
+        { value: 'default', name: 'Default', description: 'Full editing and execution tools.' },
+        { value: 'plan', name: 'Plan', description: 'Read-only exploration that ends in a plan for review.' },
+      ],
+    })
+    expect(response.modes).toEqual({ currentModeId: 'default', availableModes: AVAILABLE_MODES })
+  })
+
+  it('resumes with the mode select carrying the restored plan state', async () => {
+    const bridge = await harnessWithModes()
+    const { sessionId } = await bridge.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await bridge.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'plan' })
+    await vi.waitFor(() => {
+      expect(bridge.sessionUpdates.at(-1)?.update).toMatchObject({ sessionUpdate: 'current_mode_update', currentModeId: 'plan' })
+    })
+    await bridge.client.closeSession({ sessionId })
+
+    const resumed = await bridge.client.resumeSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
+    expect(resumed.configOptions?.find(option => option.id === 'session_mode'))
+      .toMatchObject({ currentValue: 'plan' })
+    expect(resumed.modes?.currentModeId).toBe('plan')
+  })
+
+  it('switches through the config option and converges with the legacy method', async () => {
+    const bridge = await harnessWithModes()
+    const { sessionId } = await bridge.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = bridge.ctx.agents.get(SessionId(sessionId))!
+
+    const switched = await bridge.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'plan' })
+    expect(switched.configOptions?.find(option => option.id === 'session_mode'))
+      .toMatchObject({ currentValue: 'plan' })
+    await vi.waitFor(() => {
+      expect(bridge.sessionUpdates.at(-1)).toMatchObject({
+        sessionId,
+        update: { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
+      })
+    })
+    expect(bridge.ctx.planMode.get(agent).active).toBe(true)
+
+    // The legacy method reads back the state the config option just wrote.
+    const back = await bridge.client.setSessionMode({ sessionId, modeId: 'default' })
+    expect(back).toEqual({})
+    const readBack = await bridge.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'default' })
+    expect(readBack.configOptions?.find(option => option.id === 'session_mode'))
+      .toMatchObject({ currentValue: 'default' })
+  })
+
+  it('routes both mode APIs through the preset realm in preference to the host plane', async () => {
+    harness = await makeBridgeHarness({ presets: true, planMode: true, script: [] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+
+    await harness.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'plan' })
+    const realm = harness.presets!.realmPlanModes.get(agent)
+    expect(realm?.setCalls).toEqual([true])
+    expect(harness.ctx.planMode.get(agent).active).toBe(false)
+  })
+
+  it('rejects unknown mode values through the config option', async () => {
+    const bridge = await harnessWithModes()
+    const { sessionId } = await bridge.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    await expect(bridge.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'yolo' }))
+      .rejects.toThrow(/unknown mode: yolo/)
+  })
+
+  it('advertises no mode select without a plan-mode service', async () => {
+    harness = await makeBridgeHarness({ script: [] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId, configOptions } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    expect(configOptions?.some(option => option.id === 'session_mode')).toBe(false)
+    await expect(harness.client.setSessionConfigOption({ sessionId, configId: 'session_mode', value: 'plan' }))
+      .rejects.toThrow(/modes are not available/)
+  })
 })

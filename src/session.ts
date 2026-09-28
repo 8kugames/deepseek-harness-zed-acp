@@ -21,10 +21,12 @@ import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/ds
 import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
+import { acpConfigOptions } from './config-options.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
 import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
+import { AcpSessionModeControl, SESSION_MODE_CONFIG_ID, modeState } from './session-mode-control.ts'
 import {
   TurnStatsCollector,
   emptySessionStats,
@@ -48,6 +50,7 @@ import {
   type ProjectedToolCall,
   type TerminalPresentation,
 } from './updates.ts'
+
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
 interface ContinuableDrain {
@@ -99,26 +102,6 @@ interface InflightPrompt {
 /** Standard invalid-parameter failure with protocol-safe detail. */
 function invalidParams(detail: string): RequestError {
   return RequestError.invalidParams(undefined, detail)
-}
-
-const DEFAULT_MODE = {
-  id: DEFAULT_MODE_ID,
-  name: 'Default',
-  description: 'Full editing and execution tools.',
-} as const
-
-const PLAN_MODE = {
-  id: PLAN_MODE_ID,
-  name: 'Plan',
-  description: 'Read-only exploration that ends in a plan for review.',
-} as const
-
-/** Build the advertised mode state from the plan-mode service's current selection. */
-function modeState(planMode: PlanModeController, agent: Agent): SessionModeState {
-  return {
-    currentModeId: planMode.get(agent).active ? PLAN_MODE_ID : DEFAULT_MODE_ID,
-    availableModes: [DEFAULT_MODE, PLAN_MODE],
-  }
 }
 
 /** Standard internal failure with protocol-safe detail. */
@@ -181,12 +164,14 @@ export class AcpSession {
     this.permissionControl = permissions === undefined
       ? undefined
       : new AcpPermissionControl(permissions, this.agent.session)
+    this.modeControl = new AcpSessionModeControl(this.agent, () => this.planMode())
     this.disposeAgent = () => handle.dispose()
   }
 
   private readonly disposeAgent: () => Promise<void>
   private readonly presetControl: AcpPresetControl | undefined
   private readonly permissionControl: AcpPermissionControl | undefined
+  private readonly modeControl: AcpSessionModeControl
 
   /**
    * Compose a fresh Agent and all requested MCP clients before publication.
@@ -274,20 +259,19 @@ export class AcpSession {
   /**
    * Return the complete standard configuration state: the preset select when
    * the deployment composes a roster, the permission select when it composes
-   * the permission service, then the model selections.
+   * the permission service, the Default/Plan mode select when this session's
+   * composition provides a plan-mode service, then the model selections.
    * @param signal - optional catalog and exact-model cancellation.
    * @returns all current configuration options.
    */
   async configOptions(signal?: AbortSignal): Promise<SessionConfigOption[]> {
     this.assertActive()
-    const presetOption = this.presetControl === undefined ? undefined : await this.presetControl.option()
-    const permissionOption = this.permissionControl === undefined ? undefined : this.permissionControl.option()
-    const modelOptions = await this.modelControl.options(signal)
-    return [
-      ...(presetOption === undefined ? [] : [presetOption]),
-      ...(permissionOption === undefined ? [] : [permissionOption]),
-      ...modelOptions,
-    ]
+    return acpConfigOptions({
+      preset: this.presetControl,
+      permission: this.permissionControl,
+      mode: this.modeControl,
+      model: this.modelControl,
+    }, signal)
   }
 
   /**
@@ -303,6 +287,8 @@ export class AcpSession {
       await this.presetControl.set(value)
     } else if (this.permissionControl !== undefined && configId === PERMISSION_CONFIG_ID) {
       this.permissionControl.set(value)
+    } else if (configId === SESSION_MODE_CONFIG_ID) {
+      this.modeControl.set(value)
     } else {
       await this.modelControl.set(configId, value, signal)
     }

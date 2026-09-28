@@ -4,11 +4,11 @@
 
 一个面向 [Agent Client Protocol](https://agentclientprotocol.com/) 的服务器，为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 打包成可自由安装的 dsh 插件。它把 `dsh` 变成 [Zed](https://zed.dev)（或任何 ACP 客户端）可以驱动的外部 agent：流式回答与思考过程、带真实文件差异的工具调用、计划模式、agent 预设、权限预设、会话历史与 MCP 服务器。
 
-按 dsh `0.1.7-rc.2` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
+按 dsh `0.2.0-rc.1` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
 
 ## 安装
 
-前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.1.7-rc.2`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。
+前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.2.0-rc.1`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。
 
 在首个 npm 发布之前，直接从本仓库安装（ref 指向携带插件的分支；合并进 `master` 后改为 `master`）：
 
@@ -82,7 +82,7 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 
 ## 兼容性
 
-peer 范围声明为 `~0.1.7-rc.2`：自 `0.1.7-rc.2` 起的 0.1.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。
+peer 范围声明为 `~0.2.0-rc.1`：自 `0.2.0-rc.1` 起的 0.2.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。
 
 面向客户端的扩展都有优雅降级：展示终端、计划、会话标题与斜杠命令投射只用标准 ACP 更新；终端本身仅在客户端于 `initialize` 声明 Zed 的 `terminal_output` 能力时激活，未声明的客户端不会看到任何终端形状的更新，继续收到纯文本工具结果。
 

@@ -384,6 +384,8 @@ export async function makeBridgeHarness(options: {
   presets?: boolean
   /** Mount the stub permission-preset service, as the shipped dsh-base bundle does. */
   permissions?: boolean
+  /** Provide the agent-default-model service, as the shipped dsh-base bundle does. */
+  defaultModel?: { provider: string; model: string }
 } = {}): Promise<BridgeHarness> {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
@@ -408,6 +410,10 @@ export async function makeBridgeHarness(options: {
   }
   const stubPermissions = options.permissions === true ? new StubPermissionPresets() : undefined
   if (stubPermissions !== undefined) ctx.provide('permissionPresets', stubPermissions as unknown as PermissionPresetService)
+  if (options.defaultModel !== undefined) {
+    // The real service reads volatile per-profile settings; the stub detaches one fixed selection.
+    ctx.provide('agentDefaultModel', { currentSelection: () => ({ ...options.defaultModel }) } as never)
+  }
   const loopFiber = await ctx.plugin(AgentLoop, { agents: [] })
   const primaryAdapter = ctx.llm.registerAdapter(['mock'], adapter)
 

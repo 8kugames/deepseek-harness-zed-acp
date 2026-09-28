@@ -175,9 +175,9 @@
     # The Zed-oriented ACP bridge: the widened server over the base
     # composition. Referenced by package name so the installed package
     # resolves; the package `exports["."]` points at dist/index.js.
+    # No provider/model pin: fresh sessions inherit the composition's
+    # agent-default-model selection, and the bridge's image-input probe
+    # follows that same route.
     - id: zed-acp
       name: "@8kugames/dsh-zed-acp"
       inject: [zedAcpStartup]
-      config:
-        provider: deepseek-official
-        model: deepseek-v4-flash

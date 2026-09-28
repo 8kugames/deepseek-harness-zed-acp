@@ -79,6 +79,20 @@ async function assertImageRoute(ctx: Context, route: ModelSelection | undefined,
 }
 
 /**
+ * Whether the mounted attachment store can hold one ACP inline image. The media
+ * vocabulary is shared with prompt admission; unlike the route-aware probe
+ * below this ignores the configured model, so a deployment can advertise image
+ * input for adapters whose catalog omits `inputModalities`.
+ * @param ctx - bridge context carrying the optional attachment store.
+ * @returns whether the store accepts at least one supported raster format.
+ */
+export function mountsAcpImageAttachments(ctx: Context): boolean {
+  const attachments = ctx.get('attachments')
+  if (attachments === undefined) return false
+  return attachments.imageLimits.mediaTypes.some(mediaType => IMAGE_MEDIA_TYPES.includes(mediaType))
+}
+
+/**
  * Determine whether initialization may truthfully advertise inline image prompts.
  * Unknown service, route, capability, or deployment media support is negative.
  * @param ctx - bridge context carrying optional attachment and model services.
@@ -91,10 +105,9 @@ export async function supportsAcpImagePrompts(
   provider: string | undefined,
   model: string | undefined,
 ): Promise<boolean> {
-  const attachments = ctx.get('attachments')
   const llm = ctx.get('llm')
-  if (attachments === undefined || llm === undefined || provider === undefined || model === undefined) return false
-  if (!attachments.imageLimits.mediaTypes.some(mediaType => IMAGE_MEDIA_TYPES.includes(mediaType))) return false
+  if (llm === undefined || provider === undefined || model === undefined) return false
+  if (!mountsAcpImageAttachments(ctx)) return false
   try {
     const info = await llm.resolveModelInfo(provider, model)
     return info.inputModalities?.includes('image') === true
