@@ -252,6 +252,7 @@ describe('stats presentation', () => {
       turn: 7,
       uncachedInputTokens: 2_200,
       cacheReadTokens: 800,
+      cacheHitPercent: 25.81,
       llmMs: 3_200,
       toolMs: 500,
       decodeMs: 1_700,
@@ -261,6 +262,7 @@ describe('stats presentation', () => {
     })
     expect(meta.dsh.session).toMatchObject({
       uncachedInputTokens: 2_700,
+      cacheHitPercent: 34.09,
       llmMs: 9_400,
       toolMs: 2_000,
       ttftAvgMs: 720,
@@ -335,6 +337,7 @@ describe('formatStatsCard', () => {
     expect(card).toContain('| Input · cache write | 500 |')
     expect(card).toContain('| Input · uncached | 1,000 |')
     expect(card).toContain('| Output | 400 |')
+    expect(card).toContain('cache hit 85.7% · session cache hit 85.7%')
     expect(card).toContain('avg first token 320ms')
     expect(card).toContain('decode 200.0 tok/s')
     expect(card).toContain('turn $0.0123')
@@ -353,6 +356,7 @@ describe('formatStatsCard', () => {
     expect(card).toContain('**Turn stats** — llm 900ms · tools 0ms')
     expect(card).not.toContain('cache read')
     expect(card).not.toContain('cache write')
+    expect(card).not.toContain('cache hit')
     expect(card).not.toContain('first token')
     expect(card).not.toContain('tok/s')
     expect(card).not.toContain('$')

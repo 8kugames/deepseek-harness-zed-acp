@@ -38,6 +38,8 @@ import {
   type InitializeResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -68,7 +70,7 @@ import type {} from '@deepseek-ai/dsh-user-questions'
 import { authenticate as authenticateCredential, acpAuthMethods, resolveApiKeyRef } from './auth.ts'
 import { mountsAcpImageAttachments, supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
-import { AcpModelConfigError } from './model-control.ts'
+import { AcpModelConfigError, createReasoningPreferenceStore, defaultReasoningPreferencePath } from './model-control.ts'
 import { AcpPermissionConfigError } from './permission-control.ts'
 import { AcpPresetConfigError } from './preset-control.ts'
 import { AcpSessionModeConfigError } from './session-mode-control.ts'
@@ -108,6 +110,14 @@ export interface AcpConfig {
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
   /**
+   * File path persisted reasoning-effort choices are read from and written
+   * through to. Defaults to `~/.dsh/zed-acp-reasoning-efforts.json`; a relative
+   * path resolves against the bridge process working directory, so deployments
+   * overriding it should pin an absolute path to keep tests and parallel
+   * installs off the shared user file.
+   */
+  modelPreferencePath?: string
+  /**
    * Whether to advertise inline image prompts when the attachment store is
    * mounted. `'auto'` (the default) requires the route a fresh session starts
    * on — the pinned provider/model, else the composition's default model — to
@@ -125,6 +135,7 @@ export const Config: Schema<AcpConfig> = Schema.object({
   model: Schema.string(),
   apiKeyEnv: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
+  modelPreferencePath: Schema.string(),
   imageInputs: Schema.union([Schema.const('auto'), Schema.boolean()]).default('auto'),
 })
 
@@ -165,6 +176,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const sessions = new Map<SessionId, AcpSession>()
   const activating = new Set<SessionId>()
   const prices = buildPriceTable(process.env.DSH_ACP_PRICES, (message) => { logger.warn(message) })
+  const preferenceStore = createReasoningPreferenceStore(config.modelPreferencePath ?? defaultReasoningPreferencePath())
   let closed = false
   let imagePromptEnabled = false
   // Zed's display-terminal extension: the client advertises it in the
@@ -222,6 +234,31 @@ export function apply(ctx: Context, config: AcpConfig): void {
     for (const record of sessions.values()) record.publishAvailableCommands()
   })
 
+  // Continuable-subagent visibility: descendant agents (header lineage) route
+  // to their root ACP session, which holds its prompt open while they work and
+  // projects each activity period as a synthetic card. The lineage map covers
+  // grandchildren transitively: a child's own children resolve through the
+  // child's entry, mirroring the recursive descendant drain.
+  const descendantRoots = new Map<SessionId, AcpSession>()
+  const recordOwningSession = (sessionId: SessionId): AcpSession | undefined =>
+    descendantRoots.get(sessionId) ?? sessions.get(sessionId)
+  ctx.on('agent/created', ({ agent }) => {
+    const parent = agent.session.header.parentSession
+    if (parent === undefined) return
+    const record = recordOwningSession(parent)
+    if (record === undefined) return
+    descendantRoots.set(agent.session.id, record)
+    record.onDescendantBorn(agent)
+  })
+  ctx.on('agent/status', ({ agent, status }) => {
+    descendantRoots.get(agent.session.id)?.onDescendantStatus(agent, status)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    const record = descendantRoots.get(agent.session.id)
+    descendantRoots.delete(agent.session.id)
+    record?.onDescendantGone(agent)
+  })
+
   // Permission requests are a machine policy channel for ACP clients such as
   // dsh-subagent-acp. The bridge offers one-shot choices only and never infers a
   // durable grant from an unknown client response.
@@ -272,6 +309,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         agentCapabilities: {
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
+          loadSession: true,
           sessionCapabilities: { close: {}, list: {}, resume: {} },
         },
         authMethods: acpAuthMethods(),
@@ -294,6 +332,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           mcpServers: params.mcpServers,
           agentOptions: agentOptions(config),
           fallbackSelection: initialSelection(ctx, config),
+          preferenceStore,
           signal,
           notify,
           prices,
@@ -354,6 +393,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             mcpServers: params.mcpServers ?? [],
             agentOptions: agentOptions(config),
             fallbackSelection: initialSelection(ctx, config),
+            preferenceStore,
             signal,
             notify,
             prices,
@@ -387,6 +427,72 @@ export function apply(ctx: Context, config: AcpConfig): void {
         } catch (error: unknown) {
           sessions.delete(sessionId)
           await record.close('session/resume option discovery failed')
+          throw error
+        }
+      })().finally(() => { activating.delete(sessionId) })
+    },
+
+    async loadSession(params: LoadSessionRequest, signal: AbortSignal): Promise<LoadSessionResponse> {
+      assertOpen()
+      validateWorkspaceParams(params)
+      const sessionId = brandString<SessionId>(params.sessionId)
+      if (sessions.has(sessionId) || activating.has(sessionId) || ctx.sessions.get(sessionId) !== undefined) {
+        throw invalidParams(`session is already active: ${sessionId}`)
+      }
+      activating.add(sessionId)
+      return (async (): Promise<LoadSessionResponse> => {
+        const persisted = (await persistence.stat(sessionId, { signal }))?.header
+        if (persisted === undefined || persisted.origin === 'subagent' || persisted.parentSession !== undefined) {
+          throw invalidParams(`session is not loadable: ${sessionId}`)
+        }
+        if (!await sameDirectory(persisted.cwd, params.cwd)) {
+          throw invalidParams(`session cwd does not match: ${params.cwd}`)
+        }
+        let record: AcpSession
+        try {
+          record = await AcpSession.resume(ctx, {
+            sessionId,
+            cwd: params.cwd,
+            mcpServers: params.mcpServers ?? [],
+            agentOptions: agentOptions(config),
+            fallbackSelection: initialSelection(ctx, config),
+            preferenceStore,
+            signal,
+            notify,
+            prices,
+            terminal: { enabled: clientTerminalOutput, cwd: params.cwd },
+          })
+        } catch (error: unknown) {
+          if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
+          throw error
+        }
+        /* v8 ignore start -- the persisted header was checked before resume; the factory restores that exact header. */
+        if (!await sameDirectory(record.agent.session.header.cwd, params.cwd)) {
+          await record.close('session/load cwd mismatch')
+          throw invalidParams(`session cwd does not match: ${params.cwd}`)
+        }
+        /* v8 ignore stop */
+        try {
+          // The full history rides session/update notifications ahead of this
+          // handler's response, the order the ACP spec's loading path requires.
+          await record.replayStoredHistory(signal)
+          /* v8 ignore next 4 -- a real stdio close can race an in-flight load. */
+          if (closed) {
+            await record.close('connection closed during session/load')
+            throw internalError('connection closed during session/load')
+          }
+          sessions.set(sessionId, record)
+          const configOptions = await record.configOptions(signal)
+          const modes = record.modesState()
+          // Same response-first deferral as session/new: the roster follows the
+          // session/load response onto the wire.
+          setImmediate(() => {
+            if (sessions.get(sessionId) === record) record.publishAvailableCommands()
+          })
+          return { ...(modes === undefined ? {} : { modes }), configOptions }
+        } catch (error: unknown) {
+          sessions.delete(sessionId)
+          await record.close('session/load activation failed')
           throw error
         }
       })().finally(() => { activating.delete(sessionId) })
@@ -480,6 +586,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         throw internalError(`session close failed: ${errorChain(error)}`)
       } finally {
         if (sessions.get(sessionId) === record) sessions.delete(sessionId)
+        // A failed drain leaves live descendants whose lineage entries would
+        // otherwise outlive this record and route later events into it.
+        for (const [descendantId, root] of descendantRoots) {
+          if (root === record) descendantRoots.delete(descendantId)
+        }
       }
       return {}
     },
@@ -519,6 +630,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.setMode, ({ params }) => implementation.setSessionMode(params))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
+    .onRequest(methods.agent.session.load, ({ params, signal }) => implementation.loadSession(params, signal))
   const connection = app.connect(stream)
   const conn: AgentContext = connection.client
 
@@ -531,6 +643,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     // prompt stops before any descendant or persistence drain can block.
     quiescing = (async () => {
       const disposals = await Promise.allSettled(records.map(record => record.close('ACP bridge disposed')))
+      descendantRoots.clear()
       for (const record of records) {
         /* v8 ignore next -- closed blocks concurrent handlers; each captured record remains mapped until this loop. */
         if (sessions.get(record.agent.session.id) === record) sessions.delete(record.agent.session.id)

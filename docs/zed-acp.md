@@ -58,7 +58,11 @@ The mode picker in the agent panel offers **Default** and **Plan**. Plan mode is
 
 ## Reopen earlier sessions
 
-Sessions persist under the harness home, so the session history in Zed lists earlier root sessions from the same working directory and reopens them without replaying old messages into the panel.
+Sessions persist under the harness home, so the session history in Zed lists earlier root sessions from the same working directory. Reopening one loads it through ACP `session/load`: the bridge replays the stored conversation into the panel as `session/update` notifications before the load response, and the next prompt continues that same durable session.
+
+## Watch background subagents
+
+When the agent delegates to a continuable subagent (`backgroundMode: continuable`), the spawned work outlives the tool call that started it, so the bridge keeps the turn open until every background descendant goes idle — the panel keeps its busy state instead of reporting the request as finished while work continues. Cancelling settles the turn promptly and leaves the still-running work visible as one synthetic tool card per activity period (`Background subagent`, in-progress while it runs). Reopening the session later replays each descendant's persisted fate from the child session's own log — interrupted or crashed work settles as `failed`, finished work as `completed` — so an interrupted delegation cannot pass as the early-settled spawn call's success. A descendant that wakes again after the turn fully settled only opens a new card; it does not reopen the finished turn.
 
 ## Serve self-configured models
 

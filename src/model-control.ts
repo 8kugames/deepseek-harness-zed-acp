@@ -1,5 +1,9 @@
 /** Standard ACP session configuration over one Agent's model selection. */
 
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionConfigOption, SessionConfigValueId } from '@agentclientprotocol/sdk'
 import { installModelSelection, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
@@ -9,6 +13,7 @@ const MODEL_CONFIG_ID = 'model'
 const REASONING_CONFIG_ID = 'reasoning_effort'
 // DSH reasoning effort ids are non-empty, so the empty opaque ACP value is a disjoint provider-default choice.
 const PROVIDER_DEFAULT_REASONING_VALUE = ''
+const PREFERENCE_FILE_VERSION = 1
 
 interface ModelChoice {
   selection: ModelSelection
@@ -28,12 +33,104 @@ export class AcpModelConfigError extends Error {
   }
 }
 
+/** Persisted reasoning-effort preference port; production uses one JSON file. */
+export interface ReasoningPreferenceStore {
+  /** Read every persisted route choice; a missing file reads as empty. */
+  load(): Promise<Iterable<readonly [routeValue: string, effort: string]>>
+  /** Merge one route choice into the persisted file; `undefined` deletes it. */
+  update(routeValue: string, effort: string | undefined): Promise<void>
+}
+
+/** A preference file whose content fails format validation; safe to rebuild from empty. */
+class PreferenceFormatError extends Error {}
+
+/**
+ * Build the file-backed preference store. Updates are read-merge-write with a
+ * same-directory rename so a crash never leaves a torn file at the target
+ * path; a corrupt file is rebuilt from the triggering update (format errors
+ * only — transient I/O failures rethrow so they can never wipe usable
+ * preferences), and updates are serialized per process because concurrent
+ * sessions share one store instance. Cross-process writes race
+ * last-writer-wins on single routes.
+ * ponytail: the route count is unbounded but capped in practice by the
+ * distinct provider/model pairs one user ever picks; revisit only if providers
+ * start exposing rotate-by-date model ids.
+ */
+export function createReasoningPreferenceStore(path: string): ReasoningPreferenceStore {
+  const readEntries = async (): Promise<Map<string, string>> => {
+    let json: string
+    try {
+      json = await readFile(path, 'utf8')
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Map()
+      throw error
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(json)
+    } catch (_invalidJson) {
+      throw new PreferenceFormatError(`invalid JSON in reasoning preference file ${path}`)
+    }
+    const efforts = (parsed as { efforts?: unknown })?.efforts
+    if (typeof parsed !== 'object' || parsed === null
+      || (parsed as { version?: unknown }).version !== PREFERENCE_FILE_VERSION
+      || typeof efforts !== 'object' || efforts === null || Array.isArray(efforts)) {
+      throw new PreferenceFormatError(`invalid shape in reasoning preference file ${path}`)
+    }
+    const entries = new Map<string, string>()
+    // Whole-file integrity: one invalid entry rejects the file instead of
+    // salvaging the rest — a format error means external tampering or a torn
+    // write, and the next update's empty-table rebuild is the honest recovery;
+    // per-entry salvage would silently resurrect half-corrupted state.
+    for (const [routeValue, effort] of Object.entries(efforts as Record<string, unknown>)) {
+      if (typeof effort !== 'string' || effort.length === 0) {
+        throw new PreferenceFormatError(`invalid reasoning preference entry for ${routeValue} in ${path}`)
+      }
+      entries.set(routeValue, effort)
+    }
+    return entries
+  }
+  let updateTail: Promise<void> = Promise.resolve()
+  return {
+    load: async () => await readEntries(),
+    update: (routeValue, effort) => {
+      const operation = async (): Promise<void> => {
+        let entries: Map<string, string>
+        try {
+          entries = await readEntries()
+        } catch (error: unknown) {
+          if (!(error instanceof PreferenceFormatError)) throw error
+          entries = new Map()
+        }
+        if (effort === undefined) entries.delete(routeValue)
+        else entries.set(routeValue, effort)
+        await mkdir(dirname(path), { recursive: true })
+        const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+        await writeFile(tmp, `${JSON.stringify({ version: PREFERENCE_FILE_VERSION, efforts: Object.fromEntries(entries) }, null, 2)}\n`)
+        await rename(tmp, path)
+      }
+      const result = updateTail.then(operation)
+      updateTail = result.then(() => undefined, () => undefined)
+      return result
+    },
+  }
+}
+
+/** Default user-scope path for the persisted reasoning-effort preferences. */
+export function defaultReasoningPreferencePath(): string {
+  return join(homedir(), '.dsh', 'zed-acp-reasoning-efforts.json')
+}
+
 /**
  * Project and mutate one Agent's provider/model/reasoning selection through ACP
- * config options. A route whose resolution fails after an earlier success
- * degrades to the last resolved state: the model option keeps the selection
- * and the reasoning option is reassembled from the last resolved reasoning
- * metadata for that exact route, with a warning instead of a silent omission.
+ * config options. Explicitly chosen reasoning efforts are remembered per exact
+ * route — optionally persisted across sessions through a preference store — so
+ * switching models restores the target route's choice or carries a surviving
+ * id instead of resetting to provider defaults. A route whose resolution fails
+ * after an earlier success degrades to the last resolved state: the model
+ * option keeps the selection and the reasoning option is reassembled from the
+ * last resolved reasoning metadata for that exact route, with a warning
+ * instead of a silent omission.
  */
 export class AcpModelControl {
   /** Scoped selection reference consumed by Agent request assembly. */
@@ -51,11 +148,20 @@ export class AcpModelControl {
    * defaults but never rewrites the route).
    */
   private readonly reasoningOfRoute = new Map<SessionConfigValueId, LlmModelReasoningInfo>()
+  /**
+   * Explicitly chosen effort per exact route, overlaying one persisted-store
+   * seed loaded on first use. Route memory is what keeps a model switch from
+   * discarding the user's choice; entries appear only through explicit
+   * `reasoning_effort` mutations, never through adapter defaults.
+   */
+  private readonly effortOfRoute = new Map<SessionConfigValueId, ReasoningEffortId>()
+  private persistedLoad: Promise<void> | undefined
 
   constructor(
     private readonly llm: LlmRuntime,
     initial: ModelSelection | undefined,
     private readonly warn: (message: string) => void,
+    private readonly persist?: ReasoningPreferenceStore,
   ) {
     this.selected = initial
     const getCurrent = (): ModelSelection | undefined => this.turnSelection?.selection ?? this.selected
@@ -123,10 +229,16 @@ export class AcpModelControl {
       if (current === undefined) throw new AcpModelConfigError('this session has no model selection')
       if (configId === MODEL_CONFIG_ID) {
         const state = await this.state(signal)
-        const selected = state.choices.get(value)
-        if (selected === undefined) throw new AcpModelConfigError(`unknown model option: ${value}`)
-        await this.resolveSelection(selected, signal)
-        this.selected = selected
+        const target = state.choices.get(value)
+        if (target === undefined) throw new AcpModelConfigError(`unknown model option: ${value}`)
+        // Re-read after state(): its adoption may have just materialized the
+        // remembered effort onto this.selected, and the carry-over layer must
+        // see it even when the client never pulled options first.
+        const from: ModelSelection = this.selected ?? current
+        const effort = await this.switchEffort(from, target, signal)
+        const switched: ModelSelection = { ...target, ...effort === undefined ? {} : { reasoningEffort: effort } }
+        await this.resolveSelection(switched, signal)
+        this.selected = switched
       } else if (configId === REASONING_CONFIG_ID) {
         const info = await this.llm.resolveModelInfo(current.provider, current.model, signal)
         const providerDefault = value === PROVIDER_DEFAULT_REASONING_VALUE
@@ -142,6 +254,16 @@ export class AcpModelControl {
           model: current.model,
           ...providerDefault ? {} : { reasoningEffort: ReasoningEffortId(value) },
         }, signal)
+        const route = modelValue(current.provider, current.model)
+        if (value === PROVIDER_DEFAULT_REASONING_VALUE) this.effortOfRoute.delete(route)
+        else this.effortOfRoute.set(route, ReasoningEffortId(value))
+        if (this.persist !== undefined) {
+          // Write-through failure only loses persistence; the in-session choice already holds.
+          await this.persist.update(route, value === PROVIDER_DEFAULT_REASONING_VALUE ? undefined : value)
+            .catch((error: unknown) => {
+              this.warn(`acp: reasoning preference persist failed for ${current.provider}/${current.model}: ${errorChain(error)}`)
+            })
+        }
       } else {
         throw new AcpModelConfigError(`unknown session config option: ${configId}`)
       }
@@ -158,8 +280,28 @@ export class AcpModelControl {
 
   /** Build detached model choices and the dependent reasoning option. */
   private async state(signal?: AbortSignal): Promise<ConfigState> {
-    const selected = this.selected
+    let selected = this.selected
     if (selected === undefined) return { choices: new Map(), options: [] }
+    // Adopt the route's remembered effort when this session has no explicit
+    // choice yet: a remembered preference outranks the adapter's default.
+    if (selected.reasoningEffort === undefined) {
+      const remembered = await this.rememberedEffort(selected)
+      if (remembered !== undefined) {
+        // Support probing only drops stale ids; route failures stay
+        // authoritative in the resolveSelection below, which retries the same
+        // adapter and either fails loudly or degrades with a warning. A
+        // transiently failing probe only delays adoption to the next options()
+        // call: this.selected never records the materialized adapter default,
+        // so the adoption precondition keeps holding until it succeeds.
+        const supported = await this.llm.resolveModelInfo(selected.provider, selected.model, signal)
+          .then(info => info.reasoning?.efforts.some(effort => effort.id === remembered) === true)
+          .catch(() => false)
+        if (supported) {
+          selected = { ...selected, reasoningEffort: remembered }
+          this.selected = selected
+        }
+      }
+    }
     let resolved: ModelSelection
     let routeAvailable = true
     try {
@@ -253,6 +395,45 @@ export class AcpModelControl {
         })),
       ],
     }
+  }
+
+  /**
+   * Resolve the reasoning effort one model switch should carry: the target
+   * route's remembered choice first, the outgoing explicit choice second when
+   * its id survives on the target, and no field otherwise so provider
+   * defaults materialize. A support-probe failure only drops the carry-over;
+   * the route-validating resolveSelection after it stays the authoritative
+   * failure path, so a transient catalog hiccup can never fail the switch.
+   */
+  private async switchEffort(from: ModelSelection, to: ModelSelection, signal?: AbortSignal): Promise<ReasoningEffortId | undefined> {
+    const remembered = await this.rememberedEffort(to)
+    const candidates = [remembered, from.reasoningEffort]
+      .filter((effort): effort is ReasoningEffortId => effort !== undefined)
+    if (candidates.length === 0) return undefined
+    const reasoning = await this.llm.resolveModelInfo(to.provider, to.model, signal)
+      .then(info => info.reasoning)
+      .catch(() => undefined)
+    if (reasoning === undefined) return undefined
+    return candidates.find(effort => reasoning.efforts.some(candidate => candidate.id === effort))
+  }
+
+  /**
+   * Read one exact route's remembered explicit effort. Session choices
+   * overlay a persisted store seeded once on first use, so a fresh session
+   * adopts the user's cross-install preference before any explicit choice.
+   */
+  private async rememberedEffort(route: { provider: string; model: string }): Promise<ReasoningEffortId | undefined> {
+    if (this.persist !== undefined && this.persistedLoad === undefined) {
+      this.persistedLoad = this.persist.load().then((entries) => {
+        for (const [routeValue, effort] of entries) {
+          if (!this.effortOfRoute.has(routeValue)) this.effortOfRoute.set(routeValue, ReasoningEffortId(effort))
+        }
+      }, (error: unknown) => {
+        this.warn(`acp: reasoning preference seed failed: ${errorChain(error)}`)
+      })
+    }
+    await this.persistedLoad
+    return this.effortOfRoute.get(modelValue(route.provider, route.model))
   }
 
   /** Validate an exact route and retain only Agent-owned selection fields. */

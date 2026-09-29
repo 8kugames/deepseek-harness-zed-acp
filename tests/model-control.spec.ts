@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { ReasoningEffortId, type LlmRuntime } from '@deepseek-ai/dsh-llm'
-import { AcpModelControl } from '../src/model-control.ts'
+import { AcpModelControl, createReasoningPreferenceStore, type ReasoningPreferenceStore } from '../src/model-control.ts'
 
 /** Minimal LLM catalog/runtime double for pure standard-option tests. */
 function llmRuntime(overrides: Partial<LlmRuntime> = {}): LlmRuntime {
@@ -269,5 +272,217 @@ describe('ACP model configuration control', () => {
     const degraded = await control.options()
 
     expect(degraded.find(option => option.id === 'reasoning_effort')).toBeUndefined()
+  })
+})
+
+describe('reasoning-effort stickiness and persistence', () => {
+  const ROUTE_A = '["mock","a"]'
+  const ROUTE_B = '["mock","b"]'
+
+  /** Multi-model catalog override: per-model effort ids and optional default. */
+  function catalog(models: Record<string, { efforts: string[]; defaultEffort?: string }>): Partial<LlmRuntime> {
+    return {
+      listModels: () => Promise.resolve(Object.keys(models).map(id => ({ provider: 'mock', id, name: id }))),
+      resolveModelInfo: (provider: string, model: string) => {
+        const entry = models[model]
+        if (entry === undefined) return Promise.reject(new Error(`unknown model ${model}`))
+        return Promise.resolve({
+          provider,
+          id: model,
+          name: model,
+          reasoning: {
+            efforts: entry.efforts.map(id => ({ id: ReasoningEffortId(id), name: id })),
+            ...entry.defaultEffort === undefined ? {} : { defaultEffort: ReasoningEffortId(entry.defaultEffort) },
+          },
+        })
+      },
+      resolveCallConfig: (selection: { provider?: string; model?: string; reasoningEffort?: string }) => Promise.resolve({
+        provider: selection.provider ?? 'a',
+        model: selection.model ?? 'a',
+        ...selection.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: ReasoningEffortId(selection.reasoningEffort) },
+      }),
+    }
+  }
+
+  /** In-memory preference store double exposing its data for assertions. */
+  function memoryStore(entries: Record<string, string> = {}): ReasoningPreferenceStore & { data: Map<string, string> } {
+    const data = new Map(Object.entries(entries))
+    return {
+      data,
+      load: () => Promise.resolve(data.entries()),
+      update: (routeValue, effort) => {
+        if (effort === undefined) data.delete(routeValue)
+        else data.set(routeValue, effort)
+        return Promise.resolve()
+      },
+    }
+  }
+
+  it('keeps a surviving effort id across model switches', async () => {
+    const control = new AcpModelControl(
+      llmRuntime(catalog({
+        a: { efforts: ['low', 'high'], defaultEffort: 'high' },
+        b: { efforts: ['low', 'high'], defaultEffort: 'high' },
+      })),
+      { provider: 'mock', model: 'a' },
+      vi.fn(),
+    )
+    await control.set('reasoning_effort', 'low')
+
+    const switched = await control.set('model', ROUTE_B)
+
+    expect(switched.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'low' })
+  })
+
+  it('falls back to the target default when the id does not survive, and restores route memory on return', async () => {
+    const control = new AcpModelControl(
+      llmRuntime(catalog({
+        a: { efforts: ['low', 'high'], defaultEffort: 'high' },
+        b: { efforts: ['medium'], defaultEffort: 'medium' },
+      })),
+      { provider: 'mock', model: 'a' },
+      vi.fn(),
+    )
+    await control.set('reasoning_effort', 'low')
+
+    const onB = await control.set('model', ROUTE_B)
+    expect(onB.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'medium' })
+
+    const backOnA = await control.set('model', ROUTE_A)
+    expect(backOnA.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'low' })
+  })
+
+  it('drops the carry-over instead of failing the switch when the support probe fails once', async () => {
+    const probes = new Map<string, number>()
+    const resolveModelInfo = (provider: string, model: string) => {
+      const seen = (probes.get(model) ?? 0) + 1
+      probes.set(model, seen)
+      // The target route's first probe fails, modeling a transient catalog
+      // hiccup; later calls succeed, so the route-validating resolve below
+      // still passes and the switch must complete on the target default.
+      if (model === 'b' && seen === 1) return Promise.reject(new Error('catalog hiccup'))
+      return Promise.resolve({
+        provider,
+        id: model,
+        name: model,
+        reasoning: {
+          efforts: ['low', 'high'].map(id => ({ id: ReasoningEffortId(id), name: id })),
+          defaultEffort: ReasoningEffortId('high'),
+        },
+      })
+    }
+    const control = new AcpModelControl(
+      llmRuntime({ ...catalog({ a: { efforts: ['low', 'high'] }, b: { efforts: ['low', 'high'] } }), resolveModelInfo }),
+      { provider: 'mock', model: 'a' },
+      vi.fn(),
+    )
+    await control.set('reasoning_effort', 'low')
+
+    const switched = await control.set('model', ROUTE_B)
+
+    expect(switched.find(option => option.id === 'model')).toMatchObject({ currentValue: ROUTE_B })
+    expect(switched.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'high' })
+  })
+
+  it('seeds a fresh session from the persisted store over adapter defaults', async () => {
+    const control = new AcpModelControl(
+      llmRuntime(catalog({ a: { efforts: ['low', 'high'], defaultEffort: 'high' } })),
+      { provider: 'mock', model: 'a' },
+      vi.fn(),
+      memoryStore({ [ROUTE_A]: 'low' }),
+    )
+
+    const options = await control.options()
+
+    expect(options.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'low' })
+  })
+
+  it('records explicit choices and deletes the entry when clearing to provider default', async () => {
+    const store = memoryStore()
+    const control = new AcpModelControl(
+      llmRuntime(catalog({ a: { efforts: ['low', 'high'] } })),
+      { provider: 'mock', model: 'a' },
+      vi.fn(),
+      store,
+    )
+
+    await control.set('reasoning_effort', 'low')
+    expect(store.data.get(ROUTE_A)).toBe('low')
+
+    await control.set('reasoning_effort', '')
+    expect(store.data.has(ROUTE_A)).toBe(false)
+  })
+
+  it('warns and continues from adapter defaults when the persisted seed fails', async () => {
+    const warn = vi.fn()
+    const control = new AcpModelControl(
+      llmRuntime(catalog({ a: { efforts: ['low', 'high'], defaultEffort: 'high' } })),
+      { provider: 'mock', model: 'a' },
+      warn,
+      { load: () => Promise.reject(new Error('disk gone')), update: () => Promise.resolve() },
+    )
+
+    const options = await control.options()
+
+    expect(options.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'high' })
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reasoning preference seed failed/))
+  })
+
+  it('keeps the in-session choice when the write-through fails', async () => {
+    const warn = vi.fn()
+    const control = new AcpModelControl(
+      llmRuntime(catalog({ a: { efforts: ['low', 'high'], defaultEffort: 'high' } })),
+      { provider: 'mock', model: 'a' },
+      warn,
+      { load: () => Promise.resolve([]), update: () => Promise.reject(new Error('disk full')) },
+    )
+
+    const options = await control.set('reasoning_effort', 'low')
+
+    expect(options.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'low' })
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reasoning preference persist failed/))
+  })
+
+  it('round-trips the file-backed preference store and rejects corrupt files', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-pref-'))
+    try {
+      const path = join(dir, 'prefs.json')
+      const store = createReasoningPreferenceStore(path)
+      expect([...await store.load()]).toEqual([])
+
+      await store.update('["p","m"]', 'high')
+      expect([...await store.load()]).toEqual([['["p","m"]', 'high']])
+
+      await store.update('["p","m"]', undefined)
+      expect([...await store.load()]).toEqual([])
+
+      await writeFile(path, '{ not json', 'utf8')
+      await expect(store.load()).rejects.toThrow(/invalid JSON/)
+      await writeFile(path, JSON.stringify({ version: 2, efforts: {} }), 'utf8')
+      await expect(store.load()).rejects.toThrow(/invalid shape/)
+      await writeFile(path, JSON.stringify({ version: 1, efforts: ['x'] }), 'utf8')
+      await expect(store.load()).rejects.toThrow(/invalid shape/)
+      await writeFile(path, JSON.stringify({ version: 1, efforts: { route: 7 } }), 'utf8')
+      await expect(store.load()).rejects.toThrow(/invalid reasoning preference entry/)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rebuilds a corrupt preference file from the triggering update', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-pref-'))
+    try {
+      const path = join(dir, 'prefs.json')
+      await writeFile(path, '{ not json', 'utf8')
+      const store = createReasoningPreferenceStore(path)
+
+      await store.update('["p","m"]', 'high')
+
+      expect([...await store.load()]).toEqual([['["p","m"]', 'high']])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

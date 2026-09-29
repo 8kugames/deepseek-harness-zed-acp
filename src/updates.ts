@@ -169,6 +169,33 @@ export async function assistantUpdates(
 }
 
 /**
+ * Convert one committed human prompt into block-ordered user-message chunks.
+ * The caller filters synthetic `user/message` injections (file-change notices,
+ * skill content) that were never client-visible; only blocks the client could
+ * have echoed live are replayable.
+ * @param ctx - bridge context carrying the attachment store.
+ * @param event - committed user message event.
+ * @returns ordered standard user-message chunk updates.
+ */
+export async function userMessageUpdates(
+  ctx: Context,
+  event: SessionEvent<'user/message'>,
+): Promise<SessionUpdate[]> {
+  const updates: SessionUpdate[] = []
+  for (const block of event.data.content) {
+    const content = await assistantBlockToAcp(ctx, block)
+    if (content !== undefined) {
+      updates.push({
+        sessionUpdate: 'user_message_chunk',
+        messageId: event.data.id,
+        content,
+      })
+    }
+  }
+  return updates
+}
+
+/**
  * Derive one tool call's follow-along location from its committed arguments.
  * Each shipped file tool names its target `file_path`; the remaining probe
  * keys cover registry and MCP tools that use the common alternatives. The
@@ -381,6 +408,128 @@ export function turnStatsCard(
       content: [{ type: 'content', content: { type: 'text', text } }],
     },
   ]
+}
+
+/** Fixed card title for one live continuable-subagent activity period. */
+export const DESCENDANT_ACTIVITY_TITLE = 'Background subagent'
+
+/**
+ * Open one continuable-subagent activity period as a synthetic tool card on the
+ * parent session: `in_progress` from the descendant agent's creation until
+ * that activity period ends (idle or disposed). Like the turn-statistics card
+ * it never enters the durable DSH session, so a reloaded client does not
+ * replay it; the deferred reload projector for descendant history reuses this
+ * constructor against persisted descendant logs.
+ * ponytail: the title is fixed rather than derived from the descendant's task
+ * text — correlating a spawn with its parent `subagent` tool call's
+ * `description` is temporal-adjacency guessing under parallel spawns. Upgrade
+ * path: title from the descendant session's own durable first user message.
+ * @param toolCallId - bridge-owned synthetic id, unique per activity period.
+ * @returns the opening `tool_call` update.
+ */
+export function descendantActivityOpen(
+  toolCallId: string,
+): Extract<SessionUpdate, { sessionUpdate: 'tool_call' }> {
+  return {
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title: DESCENDANT_ACTIVITY_TITLE,
+    kind: 'other',
+    status: 'in_progress',
+  }
+}
+
+/**
+ * Settle one open descendant-activity card as `completed`.
+ * ponytail: settles bare without a result body — summarizing the activity
+ * would need the descendant session's assistant tail, which the parent-side
+ * event surface does not carry. Upgrade path shared with the reload projector.
+ * @param toolCallId - the same bridge-owned synthetic id.
+ * @returns the settling `tool_call_update`.
+ */
+export function descendantActivitySettle(
+  toolCallId: string,
+): Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }> {
+  return {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'completed',
+  }
+}
+
+/**
+ * Derive one reload-time fate card from a persisted descendant session's
+ * event log: the task title from its first user message, the fate from its
+ * last `turn/end`, and an optional summary from its last assistant message.
+ * Like the other synthetic cards this never enters the durable DSH session;
+ * it is projected only onto the reloaded client view.
+ *
+ * Fate mapping follows delegated-task semantics rather than prompt-stop
+ * semantics: `completed`, `max-tokens` (task turn ran to its ceiling), and
+ * `forked` (boundary closure) settle `completed`; `interrupted` (the durable
+ * closer a crash-orphaned turn receives on resume), `aborted` (a cancellation
+ * request stopped the live turn — the task did not run to completion),
+ * `blocked`, and `error` settle `failed`. A log with events but no `turn/end`
+ * reads as `failed` defensively.
+ * ponytail: the summary is the raw assistant tail without any transformation;
+ * a structured outcome card would need the descendant tool surface, which the
+ * child log's projection here deliberately does not interpret.
+ * @param sessionId - the descendant session id, for the synthetic card id.
+ * @param events - the descendant session's complete persisted event log.
+ * @returns the ordered card lifecycle pair, or `undefined` when the log shows
+ * no work at all (no events worth surfacing).
+ */
+export function descendantHistoryFromEvents(
+  sessionId: string,
+  events: readonly SessionEvent[],
+): [
+  Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>,
+  Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>,
+] | undefined {
+  let title: string | undefined
+  let summary: string | undefined
+  let fate: 'completed' | 'failed' | undefined
+  for (const event of events) {
+    if (event.type === 'user/message' && title === undefined) {
+      title = oneLineText(event.data.content) ?? title
+    } else if (event.type === 'assistant/message') {
+      summary = oneLineText(event.data.message.content) ?? summary
+    } else if (event.type === 'turn/end') {
+      const kind = event.data.reason.kind
+      fate = kind === 'completed' || kind === 'max-tokens' || kind === 'forked' ? 'completed' : 'failed'
+    }
+  }
+  if (fate === undefined && title === undefined && summary === undefined) return undefined
+  const toolCallId = `dsh-subagent-${sessionId}`
+  return [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId,
+      title: title === undefined || title.length === 0 ? DESCENDANT_ACTIVITY_TITLE : title,
+      kind: 'other',
+      status: 'in_progress',
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: fate ?? 'failed',
+      ...(summary === undefined || summary.length === 0 ? {} : {
+        content: [{ type: 'content' as const, content: { type: 'text' as const, text: summary } }],
+      }),
+    },
+  ]
+}
+
+/** Collapse one message's text blocks into a single capped line. */
+function oneLineText(blocks: readonly { type: string }[]): string | undefined {
+  const text = blocks
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map(block => block.text)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (text.length === 0) return undefined
+  return text.length > MAX_COMMAND_TITLE ? `${text.slice(0, MAX_COMMAND_TITLE - 1)}…` : text
 }
 
 /** Preserve malformed model output as opaque input instead of dropping the call update. */

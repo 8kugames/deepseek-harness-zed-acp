@@ -405,6 +405,19 @@ function outputTps(timing: TimingTotals): number | undefined {
   return timing.decodeMs > 0 ? timing.decodeTokens / (timing.decodeMs / 1000) : undefined
 }
 
+/**
+ * Share of a scope's prompt tokens served from the prefix cache — DeepSeek's
+ * hit bucket over the three disjoint input buckets — or undefined when the
+ * adapter reported no cache reads for it.
+ * @param usage - one scope's accounting; `uncachedInputTokens` is uncached input.
+ * @returns the hit rate as a fraction in (0, 1], or undefined without a read bucket.
+ */
+function cacheHitRate(usage: UsageTotals): number | undefined {
+  const read = usage.cacheReadTokens
+  if (read === undefined || read === 0) return undefined
+  return read / (read + (usage.cacheWriteTokens ?? 0) + usage.uncachedInputTokens)
+}
+
 /** Format a millisecond duration compactly for the stats card. */
 function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
@@ -442,6 +455,12 @@ export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId:
   lines.push(`| Input · uncached | ${turn.usage.uncachedInputTokens.toLocaleString('en-US')} |`)
   lines.push(`| Output | ${turn.usage.outputTokens.toLocaleString('en-US')} |`)
   lines.push('')
+  const cache: string[] = []
+  const turnHit = cacheHitRate(turn.usage)
+  if (turnHit !== undefined) cache.push(`cache hit ${(turnHit * 100).toFixed(1)}%`)
+  const sessionHit = cacheHitRate(session.usage)
+  if (sessionHit !== undefined) cache.push(`session cache hit ${(sessionHit * 100).toFixed(1)}%`)
+  if (cache.length > 0) lines.push(cache.join(' · '))
   const tail: string[] = []
   const ttft = ttftAvgMs(turn.timing)
   if (ttft !== undefined) tail.push(`avg first token ${formatMs(ttft)}`)
@@ -464,8 +483,10 @@ export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId:
 export function statsMeta(turn: TurnStats, session: SessionStats): { dsh: Record<string, unknown> } {
   const scope = (usage: UsageTotals, timing: TimingTotals, cost: { amount: number; currency: string } | undefined) => {
     const tps = outputTps(timing)
+    const hit = cacheHitRate(usage)
     return {
       ...usage,
+      cacheHitPercent: hit === undefined ? undefined : Number((hit * 100).toFixed(2)),
       llmMs: timing.llmMs,
       toolMs: timing.toolMs,
       decodeMs: timing.decodeMs,

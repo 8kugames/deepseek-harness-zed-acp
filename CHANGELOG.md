@@ -3,6 +3,18 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-09-29
+
+### 新增
+
+- ACP `session/load` 全量历史重载：`initialize` 通告顶层 `loadSession` 能力；加载路径复用 `session/resume` 的校验与 Agent 恢复，再经只读持久句柄读出存储事件日志，用与实时流完全相同的投影在 load 响应前把用户消息（仅直接人类提示，compaction 摘要等合成注入不回放）、助手消息、工具调用与结果、计划、模式和标题回放为 `session/update` 通知。回放转录取 append-origin 表面事件（平台契约：模型面会遮蔽被替换范围，append-origin 事件才是人类转录的持久来源），被压缩段的原始对话照常重建，摘要副本不回放；重放完成后面板即重建完整对话，下一条 prompt 继续同一持久会话。`session/resume` 保持无回放语义不变。
+
+- continuable 子代理的回合保持、活动卡片与重载命运投影：`subagent` 工具以 `backgroundMode: continuable` 派生的后代代理超出父回合存活，现会通过宿主级 `agent/created/status/disposed` 事件按 `parentSession` 血缘（含孙代传递）路由到根 ACP 会话——正常结算路径在父 Agent 空闲后继续等待全部后台后代空闲才回答 prompt（取消仍立即结算），每个后代活动期在父会话投影一张合成工具卡（`Background subagent`，born → `in_progress`，idle/disposed → `completed`；不进入 DSH 持久会话）。取消后存活的后代仍由卡片维持可见，会话关闭时沿既有 drain 顺序拆除。`session/load` 回放末尾新增命运投影：沿 `parentSession` 血缘递归收集 `origin: subagent` 后代森林（含孙代，与 live 路由对称），逐个只读其持久日志，按其最后 `turn/end`（completed/max-tokens/forked → 完成；interrupted/aborted/blocked/error → 失败，崩溃遗留回合在 resume 时由 loop 补 interrupted closer；有事件无 turn/end 亦判失败）投影已结算的命运卡（标题取子会话首条任务文本，摘要取最后助手消息），重载客户端不再把被中断的后台工作误认为已随早结算的 spawn 调用完成；fork 血缘无 subagent 标记者不参与投影。注：全静止结算后若后代再次被唤醒，仅开新卡不再持有已结束的回合（静止即结算的边界语义）。
+
+- `reasoning_effort` 选择跨模型切换与会话持久化：显式选择的推理档位按精确路由记忆——切换模型时优先恢复目标路由的历史选择，其次结转目标仍支持的相同档位 id，均不满足才回落该模型默认（切换本身绝不因此失败）；选 "Provider default" 视为清除该路由记忆。选择默认写入 `~/.dsh/zed-acp-reasoning-efforts.json`（读时容错、写时同目录 rename 原子落盘且同进程多会话写入串行化，跨进程单路由 last-writer-wins；文件格式损坏时下一次写入从空表自愈重建，其余 I/O 失败仅记 warn 不触碰既有内容、不阻断会话），新会话自动采纳持久化选择；部署可用新配置 `modelPreferencePath` 改写存储路径（应为绝对路径）。
+
+- 统计卡新增前缀缓存命中率：卡片表格下方新增 `cache hit 87.5% · session cache hit 91.2%` 一行（命中桶 / 三桶输入之和，仅在适配器上报了缓存读时显示）；`_meta.dsh` 的 turn/session 两级同步新增 `cacheHitPercent` 镜像字段。
+
 ## [0.2.1] - 2026-09-29
 
 ### 修复

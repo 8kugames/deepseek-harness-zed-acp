@@ -12,18 +12,18 @@ import {
   type SessionUpdate,
   type StopReason,
 } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentOptions, AgentStatus, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type { PlanModeController } from '@deepseek-ai/dsh-plan-mode'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import { type Session, type SessionEvent, type SessionHeader, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { acpConfigOptions } from './config-options.ts'
 import { mountAcpMcpServers } from './mcp.ts'
-import { AcpModelControl } from './model-control.ts'
+import { AcpModelControl, type ReasoningPreferenceStore } from './model-control.ts'
 import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
 import { AcpSessionModeControl, SESSION_MODE_CONFIG_ID, modeState } from './session-mode-control.ts'
@@ -45,21 +45,19 @@ import {
   assistantUpdates,
   contextUsage,
   currentModeUpdate,
+  descendantActivityOpen,
+  descendantActivitySettle,
+  descendantHistoryFromEvents,
   sessionTitleUpdate,
   todoPlanUpdate,
   toolCallUpdate,
   toolResultUpdate,
   turnStatsCard,
+  userMessageUpdates,
   type ProjectedToolCall,
   type TerminalPresentation,
 } from './updates.ts'
 
-
-/** The continuable-subagent teardown used without depending on the subagent package. */
-interface ContinuableDrain {
-  /** Dispose continuable descendants below exact host-owned parents child-first. */
-  drainContinuableDescendants(parents: readonly Agent[]): Promise<void>
-}
 
 /** Inputs shared by fresh and resumed ACP session construction. */
 interface AcpSessionBuildOptions {
@@ -67,6 +65,8 @@ interface AcpSessionBuildOptions {
   mcpServers: readonly McpServer[]
   agentOptions: AgentOptions
   fallbackSelection: ModelSelection | undefined
+  /** Persisted reasoning-effort preference store; `undefined` disables persistence. */
+  preferenceStore: ReasoningPreferenceStore | undefined
   signal: AbortSignal
   notify: (notification: SessionNotification) => Promise<void>
   /** Effective price table for turn/session cost reporting. */
@@ -84,6 +84,20 @@ export interface CreateAcpSessionOptions extends AcpSessionBuildOptions {
 export interface ResumeAcpSessionOptions extends AcpSessionBuildOptions {
   sessionId: SessionId
 }
+
+/** The continuable-subagent teardown used without depending on the subagent package. */
+interface ContinuableDrain {
+  /** Dispose continuable descendants below exact host-owned parents child-first. */
+  drainContinuableDescendants(parents: readonly Agent[]): Promise<void>
+}
+
+/**
+ * One tracked descendant agent's activity state. `known` spans creation to the
+ * first `agent/status` transition, so a continuable spawn counts as active
+ * before its driver's first `running` — closing the race where the parent
+ * settles between the spawn tool's return and the child's first status.
+ */
+type DescendantState = 'known' | 'running' | 'idle'
 
 interface InflightPrompt {
   resolve: (reason: StopReason) => void
@@ -148,6 +162,14 @@ export class AcpSession {
   private sessionStats: SessionStats = emptySessionStats()
   /** Per-call presentation state (locations, display-terminal) carried from `tool/call` to `tool/result`. */
   private readonly projectedCalls = new Map<string, ProjectedToolCall>()
+  /** Tracked descendant agents' activity states, keyed by agent id. */
+  private readonly descendantStates = new Map<string, DescendantState>()
+  /** Open synthetic activity card per tracked descendant agent id. */
+  private readonly openDescendantCards = new Map<string, string>()
+  /** Activity-period counter per tracked descendant agent id (idle → running again opens a new card). */
+  private readonly descendantPeriods = new Map<string, number>()
+  /** Resolvers released when the tracked descendants reach zero active or the prompt is cancelled. */
+  private descendantWaiters: (() => void)[] = []
 
   private constructor(
     private readonly ctx: Context,
@@ -189,6 +211,7 @@ export class AcpSession {
       ctx.llm,
       options.fallbackSelection,
       (message) => { ctx.logger.warn(message) },
+      options.preferenceStore,
     )
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
@@ -224,6 +247,7 @@ export class AcpSession {
           ctx.llm,
           selectionFor(agent.session.requestHeader(), options.fallbackSelection),
           (message) => { ctx.logger.warn(message) },
+          options.preferenceStore,
         )
         modelControl.install(agentCtx)
         if (presets !== undefined) {
@@ -583,6 +607,111 @@ export class AcpSession {
   }
 
   /**
+   * Replay a persisted session's client-visible history onto this connection.
+   *
+   * The stored log is read through a read-only persistence handle — never
+   * taking write ownership from the restored Agent — and projected with the
+   * same event-to-update routing the live firehose uses, so a reloaded client
+   * reconstructs the conversation it would have watched live. The transcript
+   * source is append-origin surface events, per the platform's contract that
+   * the model-visible surface shadows replaced ranges while append-origin
+   * events stay the durable human transcript: a compaction summary node is a
+   * model-only replacement copy, so replaying `user/message` events only for
+   * direct human prompts both restores the pre-compaction conversation the
+   * client saw live and skips the summary it never saw. Every notification is
+   * delivered before this resolves, so a `session/load` response follows its
+   * history onto the wire.
+   * @param signal - replay cancellation observed by the storage read.
+   */
+  async replayStoredHistory(signal: AbortSignal): Promise<void> {
+    const sessionId = this.agent.session.id
+    const handle = await this.ctx.sessionPersistence.open(sessionId, 'read', { signal })
+    let events: readonly SessionEvent[]
+    try {
+      events = (await handle.read(0, undefined, { signal })).events
+    } finally {
+      await handle.close()
+    }
+    for (const event of events) {
+      if (event.type === 'user/message') {
+        if (event.data.source.kind !== 'user') continue
+        const previous = this.outputTail
+        this.outputTail = previous.then(async () => {
+          for (const update of await userMessageUpdates(this.ctx, event)) {
+            await this.notify({ sessionId, update })
+          }
+        }).catch((error: unknown) => {
+          this.ctx.logger.warn(`acp: user-message replay delivery failed: ${errorChain(error)}`)
+        })
+        continue
+      }
+      this.onSessionEvent(this.agent.session, event)
+    }
+    // Reload projection for continuable descendants: the persisted child
+    // sessions carry the background work's durable fate (a crash-orphaned turn
+    // receives its `interrupted` closer on resume), which the parent log never
+    // records. One settled fate card per descendant in the `origin: 'subagent'
+    // forest rides the replay tail — collected transitively to match the live
+    // routing's grandchild coverage — so a reloaded client cannot mistake
+    // interrupted work for the early-settled spawn call's "completed". Two
+    // contract assumptions live outside this repo's dependency tree: the spawn
+    // tool stamps both `parentSession` and `origin: 'subagent'` on children
+    // (the same headers the live routing and load gates already read), and
+    // fork lineage without the subagent origin stamp is not delegated work.
+    const headers = (await this.ctx.sessionPersistence.list({ signal })).map(({ header }) => header)
+    const subagentChildren = new Map<SessionId, SessionHeader[]>()
+    for (const header of headers) {
+      if (header.parentSession === undefined || header.origin !== 'subagent') continue
+      const bucket = subagentChildren.get(header.parentSession)
+      if (bucket === undefined) subagentChildren.set(header.parentSession, [header])
+      else bucket.push(header)
+    }
+    const children: SessionHeader[] = []
+    const visited = new Set<SessionId>([sessionId])
+    let frontier: SessionId[] = [sessionId]
+    while (frontier.length > 0) {
+      const next: SessionId[] = []
+      for (const parent of frontier) {
+        for (const header of subagentChildren.get(parent) ?? []) {
+          // Immutable headers cannot form real cycles; the visited guard only
+          // bounds the walk against corrupt lineage data.
+          if (visited.has(header.id)) continue
+          visited.add(header.id)
+          children.push(header)
+          next.push(header.id)
+        }
+      }
+      frontier = next
+    }
+    children.sort((left, right) => left.createdAt - right.createdAt)
+    for (const header of children) {
+      if (signal.aborted) break
+      try {
+        const childHandle = await this.ctx.sessionPersistence.open(header.id, 'read', { signal })
+        let childEvents: readonly SessionEvent[]
+        try {
+          childEvents = (await childHandle.read(0, undefined, { signal })).events
+        } finally {
+          await childHandle.close()
+        }
+        const cards = descendantHistoryFromEvents(header.id, childEvents)
+        if (cards === undefined) continue
+        const previous = this.outputTail
+        this.outputTail = previous.then(async () => {
+          for (const update of cards) {
+            await this.notify({ sessionId, update })
+          }
+        }).catch((error: unknown) => {
+          this.ctx.logger.warn(`acp: descendant history delivery failed: ${errorChain(error)}`)
+        })
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`acp: descendant history read failed for ${header.id}: ${errorChain(error)}`)
+      }
+    }
+    await this.outputTail
+  }
+
+  /**
    * Correlate an accepted user message with its Agent turn and pinned route.
    * @param message - claimed durable inbox message.
    * @param turn - allocated Agent turn.
@@ -607,6 +736,54 @@ export class AcpSession {
     if (inflight.turn === turn) return
     inflight.agentError = new Error(errorChain(error))
     this.settleAfterQuiescence(inflight)
+  }
+
+  /**
+   * Track one descendant agent's birth as an active activity period. Birth is
+   * observed from `agent/created`, which the spawn tool's execution emits
+   * before the parent turn can settle, so the period opens inside the prompt's
+   * settlement window rather than racing it.
+   * @param agent - the newly created descendant Agent.
+   */
+  onDescendantBorn(agent: Agent): void {
+    if (this.descendantStates.has(agent.id)) return
+    this.descendantStates.set(agent.id, 'known')
+    this.openDescendantCard(agent.id)
+  }
+
+  /**
+   * Follow one tracked descendant's `agent/status` transition: `running`
+   * (re)opens an activity card, `idle` settles the open one.
+   * @param agent - the transitioning descendant Agent.
+   * @param status - the status just entered.
+   */
+  onDescendantStatus(agent: Agent, status: AgentStatus): void {
+    const previous = this.descendantStates.get(agent.id)
+    if (previous === status) return
+    // A status for an untracked descendant (an out-of-order event around
+    // disposal, or after a close drained the states) is adopted rather than
+    // dropped, so stray remaining activity still surfaces.
+    this.descendantStates.set(agent.id, status)
+    if (status === 'idle') {
+      this.settleDescendantCard(agent.id)
+    } else {
+      this.openDescendantCard(agent.id)
+    }
+    if (this.activeDescendantCount() === 0) this.releaseDescendantWaiters()
+  }
+
+  /**
+   * Retire one tracked descendant at disposal: settle its open card and forget
+   * the agent. Disposal is not an observable `agent/status`, so it must clear
+   * activity directly or a drained-but-running child would wedge the gate.
+   * @param agent - the disposed descendant Agent.
+   */
+  onDescendantGone(agent: Agent): void {
+    this.settleDescendantCard(agent.id)
+    this.descendantStates.delete(agent.id)
+    // The period counter stays monotonic across disposal: a same-id recreation
+    // (session resume) or a late status must never reuse a settled card id.
+    if (this.activeDescendantCount() === 0) this.releaseDescendantWaiters()
   }
 
   /** Await every update queued before this call. */
@@ -716,6 +893,14 @@ export class AcpSession {
         this.ctx.logger.warn(`acp: continuable subagent teardown failed: ${errorChain(error)}`)
         failures.push(new Error('continuable subagent teardown failed', { cause: error }))
       }
+      // The drain disposes tracked descendants, whose `agent/disposed` events
+      // settle their open cards; anything left (for example when no subagents
+      // service is composed) is settled here so no card spins against a closed
+      // session.
+      for (const agentId of [...this.openDescendantCards.keys()]) this.settleDescendantCard(agentId)
+      this.descendantStates.clear()
+      this.descendantPeriods.clear()
+      this.releaseDescendantWaiters()
       try {
         await this.ctx.sessions.flush(this.agent.session)
       } catch (error: unknown) {
@@ -738,6 +923,74 @@ export class AcpSession {
     return this.closing
   }
 
+  /** Number of tracked descendants whose activity period is still open (`known` or `running`). */
+  private activeDescendantCount(): number {
+    let count = 0
+    for (const state of this.descendantStates.values()) {
+      if (state !== 'idle') count += 1
+    }
+    return count
+  }
+
+  /**
+   * Resolve once no tracked descendant remains active. The promise is released
+   * either by the last activity period closing or by `cancelPrompt`, and the
+   * settlement loop re-checks the count itself, so a descendant that restarts
+   * before the re-check simply re-arms the wait.
+   */
+  private whenDescendantsSettled(): Promise<void> {
+    if (this.activeDescendantCount() === 0) return Promise.resolve()
+    return new Promise(resolve => { this.descendantWaiters.push(resolve) })
+  }
+
+  /** Release every descendant-gate waiter (activity emptied or prompt cancelled). */
+  private releaseDescendantWaiters(): void {
+    const waiters = this.descendantWaiters
+    this.descendantWaiters = []
+    for (const resolve of waiters) resolve()
+  }
+
+  /**
+   * Open this agent's current activity card, one synthetic `tool_call` per
+   * activity period riding the ordered update tail.
+   */
+  private openDescendantCard(agentId: string): void {
+    if (this.openDescendantCards.has(agentId)) return
+    const period = (this.descendantPeriods.get(agentId) ?? 0) + 1
+    this.descendantPeriods.set(agentId, period)
+    const toolCallId = `dsh-subagent-${agentId}-${period}`
+    this.openDescendantCards.set(agentId, toolCallId)
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: descendantActivityOpen(toolCallId),
+      }))
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: descendant-activity card delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
+  /** Settle this agent's open activity card, if any, on the ordered update tail. */
+  private settleDescendantCard(agentId: string): void {
+    const toolCallId = this.openDescendantCards.get(agentId)
+    if (toolCallId === undefined) return
+    this.openDescendantCards.delete(agentId)
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: descendantActivitySettle(toolCallId),
+      }))
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: descendant-activity settle delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
   private assertActive(): void {
     if (this.closing !== undefined) throw invalidParams(`session is closing: ${this.agent.session.id}`)
   }
@@ -747,6 +1000,7 @@ export class AcpSession {
     if (inflight === undefined) return
     inflight.cancelRequested = true
     inflight.admissionController.abort(new Error(detail))
+    this.releaseDescendantWaiters()
     this.settleAfterQuiescence(inflight)
     if (inflight.messageQueued) this.agent.cancel({ kind: 'user' })
   }
@@ -758,6 +1012,14 @@ export class AcpSession {
       await inflight.admissionDone
       if (inflight.messageQueued) {
         await this.agent.whenIdle()
+        // Hold the turn while continuable descendants still work: the prompt
+        // answers only after every spawned activity period goes idle, so the
+        // client cannot mistake background work for a finished turn. Cancellation
+        // skips the wait (agreed semantics: stop settles promptly, the open
+        // activity cards keep the remainder visible).
+        while (!inflight.cancelRequested && this.activeDescendantCount() > 0) {
+          await this.whenDescendantsSettled()
+        }
         await this.outputTail
       }
       /* v8 ignore next -- this prompt owns the slot until this exact settlement clears it. */

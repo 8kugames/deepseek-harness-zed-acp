@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,6 +55,7 @@ describe('automation-only ACP bridge', () => {
       agentCapabilities: {
         mcpCapabilities: { http: true },
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
+        loadSession: true,
         sessionCapabilities: { close: {}, list: {}, resume: {} },
       },
       authMethods: acpAuthMethods(),
@@ -281,6 +282,70 @@ describe('automation-only ACP bridge', () => {
     expect(harness.adapter.requests[1]?.messages.map(message => message.content)).toContainEqual([
       { type: 'text', text: 'first prompt' },
     ])
+  })
+
+  it('loads a closed persisted session with its history replayed before the response', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('first answer'), textResponse('second answer')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'first prompt' }] })
+    await harness.client.closeSession({ sessionId: created.sessionId })
+    const updatesBeforeLoad = harness.updates.length
+
+    const loaded = await harness.client.loadSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+    })
+
+    expect(loaded).toMatchObject({ configOptions: expect.any(Array) })
+    const replayed = harness.updates.slice(updatesBeforeLoad)
+    const userChunks = replayed.filter(update => update.sessionUpdate === 'user_message_chunk')
+      .map(update => update.content)
+    expect(userChunks).toContainEqual({ type: 'text', text: 'first prompt' })
+    const agentChunks = replayed.filter(update => update.sessionUpdate === 'agent_message_chunk')
+      .map(update => update.content)
+    expect(agentChunks).toContainEqual({ type: 'text', text: 'first answer' })
+    // The user's message precedes the answer that responded to it.
+    const userIndex = replayed.findIndex(update => update.sessionUpdate === 'user_message_chunk')
+    const agentIndex = replayed.findIndex(update => update.sessionUpdate === 'agent_message_chunk')
+    expect(userIndex).toBeGreaterThanOrEqual(0)
+    expect(agentIndex).toBeGreaterThan(userIndex)
+
+    await harness.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'second prompt' }] })
+
+    expect(harness.adapter.requests[1]?.messages.map(message => message.content)).toContainEqual([
+      { type: 'text', text: 'first prompt' },
+    ])
+  })
+
+  it('loads an empty persisted session without replaying anything', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.closeSession({ sessionId: created.sessionId })
+    const updatesBeforeLoad = harness.updates.length
+
+    const loaded = await harness.client.loadSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+    })
+
+    expect(loaded).toMatchObject({ configOptions: expect.any(Array) })
+    expect(harness.updates).toHaveLength(updatesBeforeLoad)
+  })
+
+  it('rejects loading an active session before composing another Agent', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    await expect(harness.client.loadSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+    })).rejects.toThrow(/session is already active/)
   })
 
   it('materializes an empty closed session for list and resume', async () => {
@@ -743,6 +808,51 @@ describe('automation-only ACP bridge', () => {
     // The route with no declared reasoning effort drops only its own select.
     expect(switched.configOptions.map(option => option.id))
       .toEqual(['preset', 'permission', 'session_mode', 'model'])
+  })
+
+  it('retains the chosen reasoning effort across model switches and sessions', async () => {
+    harness = await makeBridgeHarness({ script: [] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const reasoning = created.configOptions?.find(option => option.id === 'reasoning_effort')
+    if (reasoning?.type !== 'select') throw new Error('expected a reasoning select option')
+    const low = reasoning.options.find(option => !('group' in option) && option.name === 'Low')
+    if (low === undefined || 'group' in low) throw new Error('expected Low reasoning effort')
+    const model = created.configOptions?.find(option => option.id === 'model')
+    if (model?.type !== 'select') throw new Error('expected a model select option')
+    const entries = model.options.flatMap(option => 'group' in option ? option.options : [option])
+    const mock = entries.find(option => option.name === 'Mock Reasoner')
+    const plain = entries.find(option => option.name === 'Mock Plain')
+    if (mock === undefined || plain === undefined) throw new Error('expected mock and plain models')
+
+    await harness.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'reasoning_effort',
+      value: low.value,
+    })
+    // Switching through a route without reasoning support must not lose the
+    // choice made for the reasoning-capable route.
+    await harness.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'model',
+      value: plain.value,
+    })
+    const backOnMock = await harness.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'model',
+      value: mock.value,
+    })
+    expect(backOnMock.configOptions.find(option => option.id === 'reasoning_effort'))
+      .toMatchObject({ currentValue: 'low' })
+
+    const persisted = JSON.parse(await readFile(join(harness.persistenceRoot, 'reasoning-efforts.json'), 'utf8'))
+    expect(persisted).toEqual({ version: 1, efforts: { '["mock","mock"]': 'low' } })
+
+    // A fresh session in the same bridge adopts the persisted choice instead
+    // of resetting to the adapter default.
+    const second = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    expect(second.configOptions?.find(option => option.id === 'reasoning_effort'))
+      .toMatchObject({ currentValue: 'low' })
   })
 
   it('rejects unknown config choices without changing the selected route', async () => {

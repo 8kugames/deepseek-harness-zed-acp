@@ -333,6 +333,7 @@ interface BridgeClient {
   authenticate: NonNullable<AcpAgent['authenticate']>
   newSession: NonNullable<AcpAgent['newSession']>
   listSessions: NonNullable<AcpAgent['listSessions']>
+  loadSession: NonNullable<AcpAgent['loadSession']>
   resumeSession: NonNullable<AcpAgent['resumeSession']>
   closeSession: NonNullable<AcpAgent['closeSession']>
   setSessionConfigOption: NonNullable<AcpAgent['setSessionConfigOption']>
@@ -469,6 +470,13 @@ export async function makeBridgeHarness(options: {
   const config = { stream: agentStream, ...options.config } as AcpConfig
   if (!(options.config && 'provider' in options.config)) config.provider = 'mock'
   if (!(options.config && 'model' in options.config)) config.model = 'mock'
+  // Preference persistence defaults into the per-harness tmpdir so bridge
+  // tests never touch the developer's real ~/.dsh preference file — including
+  // an explicitly-undefined override, which must not fall through to the
+  // production default path.
+  if (options.config?.modelPreferencePath === undefined) {
+    config.modelPreferencePath = join(persistenceRoot, 'reasoning-efforts.json')
+  }
   harness.acpFiber = await ctx.plugin({
     name: 'acp-test',
     inject: [...AcpPlugin.inject],
@@ -481,6 +489,7 @@ export async function makeBridgeHarness(options: {
     authenticate: params => client.request(methods.agent.authenticate, params),
     newSession: params => client.request(methods.agent.session.new, params),
     listSessions: params => client.request(methods.agent.session.list, params),
+    loadSession: params => client.request(methods.agent.session.load, params),
     resumeSession: params => client.request(methods.agent.session.resume, params),
     closeSession: params => client.request(methods.agent.session.close, params),
     setSessionConfigOption: params => client.request(methods.agent.session.setConfigOption, params),
