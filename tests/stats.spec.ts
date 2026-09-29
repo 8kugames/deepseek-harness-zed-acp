@@ -11,6 +11,7 @@ import {
   buildPriceTable,
   emptySessionStats,
   foldTurnStats,
+  formatStatsCard,
   isPeakUtcTime,
   mergePriceOverrides,
   parsePriceOverrides,
@@ -277,7 +278,7 @@ describe('bridge turn-stats delivery', () => {
     harness = undefined
   })
 
-  it('emits a final usage_update with _meta and no stats card after a completed turn', async () => {
+  it('emits a collapsed stats tool card and the final usage_update after a completed turn', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('hi')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
@@ -285,11 +286,28 @@ describe('bridge turn-stats delivery', () => {
     expect(result.stopReason).toBe('end_turn')
     await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
 
-    // The markdown stats card is gone; the turn settles without any synthetic
-    // agent message beyond the model's own text.
+    // The card rides the tool timeline as a collapsed read-kind tool card, so
+    // the turn still settles without any synthetic agent message.
     const synthetic = harness.updates.filter(update =>
       update.sessionUpdate === 'agent_message_chunk' && 'messageId' in update && update.messageId?.startsWith('dsh-stats-'))
     expect(synthetic).toEqual([])
+
+    const cardCall = harness.updates.find(update => update.sessionUpdate === 'tool_call'
+      && 'toolCallId' in update && update.toolCallId.startsWith('dsh-stats-'))
+    expect(cardCall).toMatchObject({
+      toolCallId: 'dsh-stats-1',
+      kind: 'read',
+      status: 'in_progress',
+    })
+    if (cardCall === undefined || !('title' in cardCall)) throw new Error('expected card title')
+    expect(cardCall.title).toMatch(/^Turn stats/)
+    const cardDone = harness.updates.filter(update => update.sessionUpdate === 'tool_call_update'
+      && 'toolCallId' in update && update.toolCallId === 'dsh-stats-1')
+    expect(cardDone).toHaveLength(1)
+    expect(cardDone[0]).toMatchObject({
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: expect.stringContaining('Turn stats') } }],
+    })
 
     const final = harness.updates.at(-1)
     if (final?.sessionUpdate !== 'usage_update') throw new Error('expected final usage update')
@@ -298,5 +316,57 @@ describe('bridge turn-stats delivery', () => {
       session: expect.objectContaining({ modelCalls: 1 }),
     })
     expect(final.cost).toBeUndefined()
+  })
+})
+
+describe('formatStatsCard', () => {
+  it('renders disjoint input buckets, timing, and both cost scopes', () => {
+    const turn: TurnStats = {
+      turn: 2,
+      usage: { uncachedInputTokens: 1_000, outputTokens: 400, cacheReadTokens: 9_000, cacheWriteTokens: 500, modelCalls: 2 },
+      timing: { llmMs: 3_200, toolMs: 1_400, decodeMs: 2_000, decodeTokens: 400, ttftSumMs: 640, ttftCalls: 2 },
+      cost: { amount: 0.0123, currency: 'USD' },
+    }
+    const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
+    const card = formatStatsCard(turn, session, 'deepseek-chat')
+
+    expect(card).toContain('**Turn stats · deepseek-chat** — llm 3.2s · tools 1.4s')
+    expect(card).toContain('| Input · cache read | 9,000 |')
+    expect(card).toContain('| Input · cache write | 500 |')
+    expect(card).toContain('| Input · uncached | 1,000 |')
+    expect(card).toContain('| Output | 400 |')
+    expect(card).toContain('avg first token 320ms')
+    expect(card).toContain('decode 200.0 tok/s')
+    expect(card).toContain('turn $0.0123')
+    expect(card).toContain('session $0.0123')
+  })
+
+  it('omits absent cache rows and ungated timing or cost segments', () => {
+    const turn: TurnStats = {
+      turn: 1,
+      usage: { uncachedInputTokens: 40, outputTokens: 8, modelCalls: 1 },
+      timing: { llmMs: 900, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 },
+      cost: undefined,
+    }
+    const card = formatStatsCard(turn, emptySessionStats(), undefined)
+
+    expect(card).toContain('**Turn stats** — llm 900ms · tools 0ms')
+    expect(card).not.toContain('cache read')
+    expect(card).not.toContain('cache write')
+    expect(card).not.toContain('first token')
+    expect(card).not.toContain('tok/s')
+    expect(card).not.toContain('$')
+  })
+
+  it('suffices non-USD cost currencies with their code', () => {
+    const turn: TurnStats = {
+      turn: 3,
+      usage: { uncachedInputTokens: 10, outputTokens: 2, modelCalls: 1 },
+      timing: { llmMs: 100, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 },
+      cost: { amount: 1.5, currency: 'EUR' },
+    }
+    const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
+
+    expect(formatStatsCard(turn, session, undefined)).toContain('turn 1.5000 EUR · session 1.5000 EUR')
   })
 })

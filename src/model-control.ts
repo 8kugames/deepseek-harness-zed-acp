@@ -3,7 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionConfigOption, SessionConfigValueId } from '@agentclientprotocol/sdk'
 import { installModelSelection, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
-import { ReasoningEffortId, type LlmCallConfig, type LlmRuntime } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, errorChain, type LlmCallConfig, type LlmModelReasoningInfo, type LlmRuntime } from '@deepseek-ai/dsh-llm'
 
 const MODEL_CONFIG_ID = 'model'
 const REASONING_CONFIG_ID = 'reasoning_effort'
@@ -28,7 +28,13 @@ export class AcpModelConfigError extends Error {
   }
 }
 
-/** Project and mutate one Agent's provider/model/reasoning selection through ACP config options. */
+/**
+ * Project and mutate one Agent's provider/model/reasoning selection through ACP
+ * config options. A route whose resolution fails after an earlier success
+ * degrades to the last resolved state: the model option keeps the selection
+ * and the reasoning option is reassembled from the last resolved reasoning
+ * metadata for that exact route, with a warning instead of a silent omission.
+ */
 export class AcpModelControl {
   /** Scoped selection reference consumed by Agent request assembly. */
   readonly selection: ModelSelectionRef
@@ -36,10 +42,20 @@ export class AcpModelControl {
   private selected: ModelSelection | undefined
   private turnSelection: { turn: number; selection: ModelSelection } | undefined
   private hasResolvedState = false
+  /**
+   * Last resolved reasoning metadata per exact route, for degraded option
+   * assembly. A successful resolve that reports no reasoning clears the entry,
+   * so the cache always mirrors the latest successful answer. Keys reuses the
+   * ACP model value; this stays valid only while `resolveCallConfig` preserves
+   * the requested provider/model identity in its result (it materializes
+   * defaults but never rewrites the route).
+   */
+  private readonly reasoningOfRoute = new Map<SessionConfigValueId, LlmModelReasoningInfo>()
 
   constructor(
     private readonly llm: LlmRuntime,
     initial: ModelSelection | undefined,
+    private readonly warn: (message: string) => void,
   ) {
     this.selected = initial
     const getCurrent = (): ModelSelection | undefined => this.turnSelection?.selection ?? this.selected
@@ -153,6 +169,7 @@ export class AcpModelControl {
       if (!this.hasResolvedState) throw error
       resolved = selected
       routeAvailable = false
+      this.warn(`acp: model route resolution degraded to the last known state for ${selected.provider}/${selected.model}: ${errorChain(error)}`)
     }
     const choices = new Map<SessionConfigValueId, ModelSelection>()
     const groups = await Promise.all(this.llm.listProviders().map(async (provider) => {
@@ -196,28 +213,46 @@ export class AcpModelControl {
     const info = routeAvailable
       ? await this.llm.resolveModelInfo(resolved.provider, resolved.model, signal)
       : undefined
-    if (info?.reasoning !== undefined) {
-      options.push({
-        id: REASONING_CONFIG_ID,
-        name: 'Reasoning effort',
-        category: 'thought_level',
-        type: 'select',
-        currentValue: resolved.reasoningEffort === undefined
-          ? PROVIDER_DEFAULT_REASONING_VALUE
-          : String(resolved.reasoningEffort),
-        options: [
-          ...info.reasoning.defaultEffort === undefined
-            ? [{ value: PROVIDER_DEFAULT_REASONING_VALUE, name: 'Provider default' }]
-            : [],
-          ...info.reasoning.efforts.map(effort => ({
-            value: String(effort.id),
-            name: effort.name,
-            ...effort.description === undefined ? {} : { description: effort.description },
-          })),
-        ],
-      })
+    if (routeAvailable) {
+      const route = modelValue(resolved.provider, resolved.model)
+      if (info?.reasoning !== undefined) this.reasoningOfRoute.set(route, info.reasoning)
+      else this.reasoningOfRoute.delete(route)
+    }
+    // A degraded resolve serves the last resolved reasoning metadata for this
+    // exact route so a transient catalog failure cannot silently unpublish the
+    // selector; a successful resolve that reports no reasoning stays omitted.
+    const reasoning = info?.reasoning
+      ?? (routeAvailable ? undefined : this.reasoningOfRoute.get(modelValue(resolved.provider, resolved.model)))
+    if (reasoning !== undefined) {
+      if (resolved.reasoningEffort === undefined && reasoning.defaultEffort !== undefined) {
+        resolved = { ...resolved, reasoningEffort: reasoning.defaultEffort }
+      }
+      options.push(this.reasoningOption(reasoning, resolved.reasoningEffort))
     }
     return { choices, options }
+  }
+
+  /** Assemble the reasoning-effort selector from resolved route metadata. */
+  private reasoningOption(reasoning: LlmModelReasoningInfo, currentEffort: ReasoningEffortId | undefined): SessionConfigOption {
+    return {
+      id: REASONING_CONFIG_ID,
+      name: 'Reasoning effort',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: currentEffort === undefined
+        ? PROVIDER_DEFAULT_REASONING_VALUE
+        : String(currentEffort),
+      options: [
+        ...reasoning.defaultEffort === undefined
+          ? [{ value: PROVIDER_DEFAULT_REASONING_VALUE, name: 'Provider default' }]
+          : [],
+        ...reasoning.efforts.map(effort => ({
+          value: String(effort.id),
+          name: effort.name,
+          ...effort.description === undefined ? {} : { description: effort.description },
+        })),
+      ],
+    }
   }
 
   /** Validate an exact route and retain only Agent-owned selection fields. */

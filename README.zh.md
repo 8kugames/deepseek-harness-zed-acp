@@ -66,7 +66,7 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 
 ## 回合统计与费用
 
-每个正常收尾的 ACP 提问回合，都会以一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展（回合与会话两级的 token 与时序事实）的最终 `usage_update` 收束。Zed 的上下文条继续用 `used`/`size` 并显示费用；其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。
+每个正常收尾的 ACP 提问回合，都会以一张折叠的回合统计工具卡收束；当上下文事实可得时，共后再跟一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展（回合与会话两级的 token 与时序事实）的最终 `usage_update`。卡片是一次合成的只读工具调用，落在客户端的工具时间线里而非消息流，不进入 DSH 持久会话；内容为输入三桶拆分（缓存读/缓存写/未缓存）、输出 token、模型与工具用时、平均首 token 延迟、解码速度、本轮与累计会话费用。Zed 的原生上下文条继续用 `used`/`size`；卡片补足 Zed 原生展示不渲染的事实，其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。取消或失败的回合不发送卡片。
 
 口径完全沿用 dsh 自身统计（`dsh-token-meter` 分桶与 harness UI 的会话统计）：dsh 把 `TokenUsage.inputTokens` 映射为自己的 `uncachedInputTokens`，因此未缓存输入不会被再去减缓存读取，三个输入桶互斥；模型用时为每次模型调用的 `step/start → assistant/message`，工具用时为 `tool/call → tool/result`，TTFT 为 `step/start → 首个 token delta`，输出速度为 `首个 token delta → assistant/message`，且只在**同时**记录了该窗口与该步输出 token 的步骤上计算，因此没有流式时刻的步骤不贡献速度值、也不拉偏结果。所有时序都来自已提交事件的时间戳，而非投影时刻采样，因此重放时数值一致。
 

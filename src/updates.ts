@@ -346,6 +346,43 @@ function usageUpdate(
   }
 }
 
+/**
+ * Project the finalized turn statistics as one collapsed read-kind tool card:
+ * a synthetic `tool_call` immediately settled by its completing
+ * `tool_call_update` carrying the card's markdown text. Unlike an agent
+ * message, clients render this in their tool timeline instead of the chat
+ * stream, so the card stays visible without polluting the conversation, and
+ * it never enters the durable DSH session.
+ * @param toolCallId - bridge-owned synthetic id, unique per turn.
+ * @param title - card row title (clients show it while collapsed).
+ * @param text - the card's markdown text.
+ * @returns the ordered card lifecycle updates.
+ */
+export function turnStatsCard(
+  toolCallId: string,
+  title: string,
+  text: string,
+): [
+  Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>,
+  Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>,
+] {
+  return [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId,
+      title,
+      kind: 'read',
+      status: 'in_progress',
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text } }],
+    },
+  ]
+}
+
 /** Preserve malformed model output as opaque input instead of dropping the call update. */
 function parseToolArguments(value: string): unknown {
   try {

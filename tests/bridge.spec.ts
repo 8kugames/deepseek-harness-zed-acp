@@ -214,6 +214,10 @@ describe('automation-only ACP bridge', () => {
     await harness.client.closeSession({ sessionId: created.sessionId })
 
     await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
+    // Cancelled turns settle without the turn-stats card, whatever streamed
+    // before the cancellation.
+    expect(harness.updates.filter(update => update.sessionUpdate === 'tool_call'
+      && 'toolCallId' in update && update.toolCallId.startsWith('dsh-stats-'))).toEqual([])
     await expect(harness.client.listSessions({})).resolves.toMatchObject({
       sessions: [{ sessionId: created.sessionId, cwd: process.cwd() }],
     })

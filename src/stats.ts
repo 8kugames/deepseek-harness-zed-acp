@@ -405,6 +405,54 @@ function outputTps(timing: TimingTotals): number | undefined {
   return timing.decodeMs > 0 ? timing.decodeTokens / (timing.decodeMs / 1000) : undefined
 }
 
+/** Format a millisecond duration compactly for the stats card. */
+function formatMs(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
+/** Format a currency amount with stable precision. */
+function formatMoney(amount: number, currency: string): string {
+  return currency === 'USD' ? `$${amount.toFixed(4)}` : `${amount.toFixed(4)} ${currency}`
+}
+
+/** The card row title shown while collapsed, naming the serving model when known. */
+export function statsCardTitle(modelId: string | undefined): string {
+  return modelId === undefined ? 'Turn stats' : `Turn stats · ${modelId}`
+}
+
+/**
+ * Render the end-of-turn statistics as the markdown text of the turn-stats
+ * card. Cache rows appear only when the adapter reported them; timing and
+ * cost segments appear only when their facts exist.
+ * @param turn - finalized turn statistics.
+ * @param session - session-lifetime totals for the cumulative line.
+ * @param modelId - model selection that served the turn, if known.
+ * @returns the card's markdown text.
+ */
+export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId: string | undefined): string {
+  const lines: string[] = []
+  lines.push(`**${statsCardTitle(modelId)}** — llm ${formatMs(turn.timing.llmMs)} · tools ${formatMs(turn.timing.toolMs)}`, '')
+  lines.push('| | tokens |', '|---|---:|')
+  if (turn.usage.cacheReadTokens !== undefined) {
+    lines.push(`| Input · cache read | ${turn.usage.cacheReadTokens.toLocaleString('en-US')} |`)
+  }
+  if (turn.usage.cacheWriteTokens !== undefined) {
+    lines.push(`| Input · cache write | ${turn.usage.cacheWriteTokens.toLocaleString('en-US')} |`)
+  }
+  lines.push(`| Input · uncached | ${turn.usage.uncachedInputTokens.toLocaleString('en-US')} |`)
+  lines.push(`| Output | ${turn.usage.outputTokens.toLocaleString('en-US')} |`)
+  lines.push('')
+  const tail: string[] = []
+  const ttft = ttftAvgMs(turn.timing)
+  if (ttft !== undefined) tail.push(`avg first token ${formatMs(ttft)}`)
+  const tps = outputTps(turn.timing)
+  if (tps !== undefined) tail.push(`decode ${tps.toFixed(1)} tok/s`)
+  if (turn.cost !== undefined) tail.push(`turn ${formatMoney(turn.cost.amount, turn.cost.currency)}`)
+  if (session.cost !== undefined) tail.push(`session ${formatMoney(session.cost.amount, session.cost.currency)}`)
+  if (tail.length > 0) lines.push(tail.join(' · '))
+  return lines.join('\n')
+}
+
 /**
  * Build the forward-compatibility `_meta` payload for the final usage update:
  * the turn's and session's accounting facts in machine-readable form under a

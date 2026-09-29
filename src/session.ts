@@ -31,6 +31,8 @@ import {
   TurnStatsCollector,
   emptySessionStats,
   foldTurnStats,
+  formatStatsCard,
+  statsCardTitle,
   statsMeta,
   type PriceTable,
   type SessionStats,
@@ -47,6 +49,7 @@ import {
   todoPlanUpdate,
   toolCallUpdate,
   toolResultUpdate,
+  turnStatsCard,
   type ProjectedToolCall,
   type TerminalPresentation,
 } from './updates.ts'
@@ -182,7 +185,11 @@ export class AcpSession {
   static async create(ctx: Context, options: CreateAcpSessionOptions): Promise<AcpSession> {
     const presets = ctx.get('agentPresets')
     const agentPreset = presets === undefined ? undefined : (await presets.resolve()).id
-    const modelControl = new AcpModelControl(ctx.llm, options.fallbackSelection)
+    const modelControl = new AcpModelControl(
+      ctx.llm,
+      options.fallbackSelection,
+      (message) => { ctx.logger.warn(message) },
+    )
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
       // The header records the composition this session starts under, so a
@@ -216,6 +223,7 @@ export class AcpSession {
         modelControl = new AcpModelControl(
           ctx.llm,
           selectionFor(agent.session.requestHeader(), options.fallbackSelection),
+          (message) => { ctx.logger.warn(message) },
         )
         modelControl.install(agentCtx)
         if (presets !== undefined) {
@@ -639,10 +647,11 @@ export class AcpSession {
   }
 
   /**
-   * Deliver the finalized turn statistics: one final `usage_update` carrying
-   * cumulative cost and the machine-readable `dsh` `_meta` extension. The
-   * update queues onto the ordered output tail; turns that were cancelled or
-   * failed settle without one.
+   * Deliver the finalized turn statistics: one collapsed turn-stats tool card
+   * (markdown text in the client's tool timeline, not the chat stream), then
+   * one final `usage_update` carrying cumulative cost and the machine-readable
+   * `dsh` `_meta` extension. Both queue onto the ordered output tail; turns
+   * that were cancelled or failed settle without either.
    * @param inflight - the settling prompt slot.
    */
   private async emitTurnStats(inflight: InflightPrompt): Promise<void> {
@@ -651,20 +660,29 @@ export class AcpSession {
     if (inflight.outputError !== undefined || inflight.agentError !== undefined) return
     const end = inflight.endReason
     if (end === undefined || end.kind === 'error') return
+    const modelId = this.modelControl.snapshot()?.model
+    const updates: SessionUpdate[] = turnStatsCard(
+      `dsh-stats-${stats.turn}`,
+      statsCardTitle(modelId),
+      formatStatsCard(stats, this.sessionStats, modelId),
+    )
     const usage = contextUsage(this.ctx, this.agent.session)
-    if (usage === undefined) return
-    const update: SessionUpdate = {
-      sessionUpdate: 'usage_update',
-      used: usage.used,
-      size: usage.size,
-      ...(this.sessionStats.cost === undefined ? {} : {
-        cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
-      }),
-      _meta: statsMeta(stats, this.sessionStats),
+    if (usage !== undefined) {
+      updates.push({
+        sessionUpdate: 'usage_update',
+        used: usage.used,
+        size: usage.size,
+        ...(this.sessionStats.cost === undefined ? {} : {
+          cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
+        }),
+        _meta: statsMeta(stats, this.sessionStats),
+      })
     }
     const previous = this.outputTail
     const delivery = previous.then(async () => {
-      await this.notify({ sessionId: this.agent.session.id, update })
+      for (const update of updates) {
+        await this.notify({ sessionId: this.agent.session.id, update })
+      }
     })
     this.outputTail = delivery.catch((error: unknown) => {
       this.ctx.logger.warn(`acp: turn-stats delivery failed: ${errorChain(error)}`)

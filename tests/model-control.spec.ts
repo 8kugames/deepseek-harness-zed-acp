@@ -32,7 +32,7 @@ function llmRuntime(overrides: Partial<LlmRuntime> = {}): LlmRuntime {
 
 describe('ACP model configuration control', () => {
   it('represents an absent route and validates value types before mutation', async () => {
-    const control = new AcpModelControl(llmRuntime(), undefined)
+    const control = new AcpModelControl(llmRuntime(), undefined, vi.fn())
 
     expect(control.snapshot()).toBeUndefined()
     await expect(control.options()).resolves.toEqual([])
@@ -47,7 +47,7 @@ describe('ACP model configuration control', () => {
     const control = new AcpModelControl(llmRuntime({ listProviders: () => [] }), {
       provider: 'private',
       model: 'unlisted',
-    })
+    }, vi.fn())
 
     const options = await control.options()
 
@@ -74,7 +74,7 @@ describe('ACP model configuration control', () => {
 
   it('keeps the selected route when its provider catalog is temporarily unavailable', async () => {
     const listModels = vi.fn(() => Promise.reject(new Error('catalog unavailable')))
-    const control = new AcpModelControl(llmRuntime({ listModels }), { provider: 'mock', model: 'mock' })
+    const control = new AcpModelControl(llmRuntime({ listModels }), { provider: 'mock', model: 'mock' }, vi.fn())
 
     const options = await control.options()
 
@@ -86,7 +86,7 @@ describe('ACP model configuration control', () => {
   })
 
   it('rejects an unadvertised reasoning effort and accepts a later valid change', async () => {
-    const control = new AcpModelControl(llmRuntime(), { provider: 'mock', model: 'mock' })
+    const control = new AcpModelControl(llmRuntime(), { provider: 'mock', model: 'mock' }, vi.fn())
 
     await expect(control.set('reasoning_effort', 'extreme')).rejects.toThrow(/unknown reasoning effort/)
     const options = await control.set('reasoning_effort', 'low')
@@ -115,7 +115,7 @@ describe('ACP model configuration control', () => {
         },
       }),
     })
-    const control = new AcpModelControl(runtime, { provider: 'mock', model: 'mock' })
+    const control = new AcpModelControl(runtime, { provider: 'mock', model: 'mock' }, vi.fn())
 
     const initial = await control.options()
     expect(initial.find(option => option.id === 'reasoning_effort')).toMatchObject({
@@ -127,5 +127,147 @@ describe('ACP model configuration control', () => {
 
     expect(restored.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: '' })
     expect(control.selection.current).toEqual({ provider: 'mock', model: 'mock' })
+  })
+
+  it('reassembles the reasoning option from the last resolved route when resolution degrades', async () => {
+    let failResolve = false
+    const resolveCallConfig = vi.fn((selection: { provider?: string; model?: string; reasoningEffort?: string }) => {
+      if (failResolve) return Promise.reject(new Error('route resolve failed'))
+      return Promise.resolve({
+        provider: selection.provider ?? 'mock',
+        model: selection.model ?? 'mock',
+        ...selection.reasoningEffort === undefined
+          ? { reasoningEffort: ReasoningEffortId('high') }
+          : { reasoningEffort: ReasoningEffortId(selection.reasoningEffort) },
+      })
+    })
+    const warn = vi.fn()
+    const control = new AcpModelControl(llmRuntime({ resolveCallConfig }), { provider: 'mock', model: 'mock' }, warn)
+
+    const before = await control.options()
+    expect(before.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'high' })
+
+    // A transient resolve failure after a prior success must not silently
+    // unpublish the selector: it degrades to the cached route metadata and
+    // materializes the cached default effort as the current value.
+    failResolve = true
+    const after = await control.options()
+    expect(after.find(option => option.id === 'model')).toMatchObject({ currentValue: '["mock","mock"]' })
+    expect(after.find(option => option.id === 'reasoning_effort')).toMatchObject({
+      currentValue: 'high',
+      options: [{ name: 'Low', description: 'Less thought.' }, { name: 'High' }],
+    })
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('mock/mock'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('route resolve failed'))
+  })
+
+  it('keeps the user-selected effort as the degraded current value', async () => {
+    let failResolve = false
+    const resolveCallConfig = vi.fn((selection: { provider?: string; model?: string; reasoningEffort?: string }) => {
+      if (failResolve) return Promise.reject(new Error('route resolve failed'))
+      return Promise.resolve({
+        provider: selection.provider ?? 'mock',
+        model: selection.model ?? 'mock',
+        ...selection.reasoningEffort === undefined
+          ? { reasoningEffort: ReasoningEffortId('high') }
+          : { reasoningEffort: ReasoningEffortId(selection.reasoningEffort) },
+      })
+    })
+    const control = new AcpModelControl(llmRuntime({ resolveCallConfig }), { provider: 'mock', model: 'mock' }, vi.fn())
+    await control.options()
+    await control.set('reasoning_effort', 'low')
+
+    failResolve = true
+    const degraded = await control.options()
+
+    expect(degraded.find(option => option.id === 'reasoning_effort')).toMatchObject({ currentValue: 'low' })
+  })
+
+  it('serves Provider default on degradation when the cached route declares no default effort', async () => {
+    let failResolve = false
+    const runtime = llmRuntime({
+      resolveCallConfig: (selection: { provider?: string; model?: string; reasoningEffort?: string }) => {
+        if (failResolve) return Promise.reject(new Error('route resolve failed'))
+        return Promise.resolve({ provider: selection.provider ?? 'mock', model: selection.model ?? 'mock' })
+      },
+      resolveModelInfo: (provider: string, model: string) => Promise.resolve({
+        provider,
+        id: model,
+        name: model,
+        reasoning: {
+          efforts: [
+            { id: ReasoningEffortId('low'), name: 'Low' },
+            { id: ReasoningEffortId('high'), name: 'High' },
+          ],
+        },
+      }),
+    })
+    const control = new AcpModelControl(runtime, { provider: 'mock', model: 'mock' }, vi.fn())
+    await control.options()
+
+    failResolve = true
+    const degraded = await control.options()
+
+    expect(degraded.find(option => option.id === 'reasoning_effort')).toMatchObject({
+      currentValue: '',
+      options: [{ value: '', name: 'Provider default' }, { value: 'low' }, { value: 'high' }],
+    })
+  })
+
+  it('fails loudly when the route never resolved at least once', async () => {
+    const control = new AcpModelControl(
+      llmRuntime({ resolveCallConfig: () => Promise.reject(new Error('first resolve failed')) }),
+      { provider: 'mock', model: 'mock' },
+      vi.fn(),
+    )
+
+    await expect(control.options()).rejects.toThrow(/first resolve failed/)
+  })
+
+  it('omits the reasoning option when a successful resolve reports no reasoning', async () => {
+    const control = new AcpModelControl(
+      llmRuntime({ resolveModelInfo: (provider: string, model: string) => Promise.resolve({ provider, id: model, name: model }) }),
+      { provider: 'mock', model: 'mock' },
+      vi.fn(),
+    )
+
+    const options = await control.options()
+
+    expect(options.find(option => option.id === 'reasoning_effort')).toBeUndefined()
+  })
+
+  it('drops stale cached reasoning once a successful resolve reports none', async () => {
+    let withReasoning = true
+    const resolveModelInfo = vi.fn((provider: string, model: string) => Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      ...withReasoning ? {
+        reasoning: {
+          efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+          defaultEffort: ReasoningEffortId('high'),
+        },
+      } : {},
+    }))
+    let failResolve = false
+    const resolveCallConfig = vi.fn((selection: { provider?: string; model?: string }) => {
+      if (failResolve) return Promise.reject(new Error('route resolve failed'))
+      return Promise.resolve({ provider: selection.provider ?? 'mock', model: selection.model ?? 'mock' })
+    })
+    const control = new AcpModelControl(
+      llmRuntime({ resolveModelInfo, resolveCallConfig }),
+      { provider: 'mock', model: 'mock' },
+      vi.fn(),
+    )
+    await control.options()
+
+    // The latest successful answer wins: once the route resolves without
+    // reasoning, a later degradation must not resurrect the stale metadata.
+    withReasoning = false
+    await control.options()
+    failResolve = true
+    const degraded = await control.options()
+
+    expect(degraded.find(option => option.id === 'reasoning_effort')).toBeUndefined()
   })
 })

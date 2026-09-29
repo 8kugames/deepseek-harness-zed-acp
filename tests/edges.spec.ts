@@ -54,6 +54,8 @@ describe('ACP automation output boundary', () => {
       'tool_call_update',
       'agent_message_chunk',
       'usage_update',
+      'tool_call',
+      'tool_call_update',
       'usage_update',
     ])
     expect(harness.updates[0]).toMatchObject({
@@ -80,13 +82,13 @@ describe('ACP automation output boundary', () => {
       content: { type: 'text', text: 'done' },
     })
     expect('messageId' in harness.updates[4]!).toBe(true)
-    expect(harness.updates[6]).toMatchObject({
+    expect(harness.updates[8]).toMatchObject({
       sessionUpdate: 'usage_update',
       size: 1_024,
     })
-    if (harness.updates[6]?.sessionUpdate !== 'usage_update') throw new Error('expected usage update')
-    expect(typeof harness.updates[6].used).toBe('number')
-    if (harness.updates[6]?._meta?.dsh === undefined) throw new Error('expected stats _meta')
+    if (harness.updates[8]?.sessionUpdate !== 'usage_update') throw new Error('expected usage update')
+    expect(typeof harness.updates[8].used).toBe('number')
+    if (harness.updates[8]?._meta?.dsh === undefined) throw new Error('expected stats _meta')
   })
 
   it('negotiates the display terminal end to end for execute-kind calls', async () => {
@@ -116,7 +118,8 @@ describe('ACP automation output boundary', () => {
       _meta: { terminal_info: { terminal_id: 'call-1', cwd: process.cwd() } },
     })
     const completions = harness.updates.filter(update => update.sessionUpdate === 'tool_call_update')
-    expect(completions).toHaveLength(2)
+    // Two settle the bash display terminal; the third completes the turn-stats card.
+    expect(completions).toHaveLength(3)
     expect(completions[0]).toMatchObject({
       toolCallId: 'call-1',
       _meta: { terminal_output: { terminal_id: 'call-1', data: 'stdout line' } },
